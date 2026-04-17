@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -556,22 +557,25 @@ class RAGService:
                 "responseMimeType": "application/json",
             },
         }
-        try:
-            async with httpx.AsyncClient(timeout=40.0) as client:
-                response = await client.post(
-                    url,
-                    json=payload,
-                    headers={"x-goog-api-key": self.gemini_api_key, "Content-Type": "application/json"},
-                )
-                response.raise_for_status()
-            data = response.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(text)
-            parsed["_llm_used"] = True
-            parsed["_llm_error"] = None
-            return parsed
-        except Exception as exc:
-            return {"_llm_used": False, "_llm_error": str(exc)}
+        last_error = None
+        for _ in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=40.0) as client:
+                    response = await client.post(
+                        url,
+                        json=payload,
+                        headers={"x-goog-api-key": self.gemini_api_key, "Content-Type": "application/json"},
+                    )
+                    response.raise_for_status()
+                data = response.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = self._parse_gemini_json(text)
+                parsed["_llm_used"] = True
+                parsed["_llm_error"] = None
+                return parsed
+            except Exception as exc:
+                last_error = str(exc)
+        return {"_llm_used": False, "_llm_error": last_error}
 
     def _build_gemini_prompt(
         self,
@@ -651,6 +655,24 @@ Baseline recommendations:
             except Exception:
                 continue
         return merged or fallback
+
+    def _parse_gemini_json(self, text: str) -> dict:
+        cleaned = text.strip()
+
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+
+        raise ValueError("Gemini response did not contain valid JSON.")
 
     def _rank_recommendations_for_query(
         self,
