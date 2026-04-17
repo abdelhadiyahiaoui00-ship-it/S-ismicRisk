@@ -25,6 +25,14 @@ class PolicyRead(BaseModel):
     zone_sismique: str
     capital_assure: Decimal
     prime_nette: Decimal
+    prime_rate: Decimal | None = None
+    lat: Decimal | None = None
+    lon: Decimal | None = None
+    zone_source: str | None = None
+    coordinate_source: str | None = None
+    zone_match_method: str | None = None
+    zone_num: int | None = None
+    source_sheet: str | None = None
     zone_policy_count_year: int | None = None
     zone_capital_assure_total_year: Decimal | None = None
     wilaya_policy_count_year: int | None = None
@@ -46,4 +54,3 @@ class PortfolioSummary(BaseModel):
     total_prime_nette: Decimal
     by_zone: list[dict[str, Decimal | int | str]]
     by_year: list[dict[str, Decimal | int]]
-

@@ -32,6 +32,14 @@ class Policy(TimestampMixin, Base):
 
     capital_assure: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     prime_nette: Mapped[Decimal] = mapped_column(Numeric(18, 3), nullable=False)
+    prime_rate: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    lat: Mapped[Decimal | None] = mapped_column(Numeric(10, 7), nullable=True)
+    lon: Mapped[Decimal | None] = mapped_column(Numeric(10, 7), nullable=True)
+    zone_source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    coordinate_source: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    zone_match_method: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    zone_num: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_sheet: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     zone_policy_count_year: Mapped[int] = mapped_column(Integer, nullable=True)
     zone_capital_assure_total_year: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=True)
@@ -39,4 +47,3 @@ class Policy(TimestampMixin, Base):
     wilaya_capital_assure_total_year: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=True)
     wilaya_zone_policy_count_year: Mapped[int] = mapped_column(Integer, nullable=True)
     wilaya_zone_capital_assure_total_year: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=True)
-

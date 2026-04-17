@@ -12,27 +12,50 @@ MapLayer = Literal["risk", "exposure", "score", "simulation"]
 class WilayaBasic(BaseModel):
     code: str
     name: str
+    commune_count: int | None = None
 
 
 class CommuneBasic(BaseModel):
-    code: str
+    id: int | None = None
+    code: str | None = None
     name: str
+    wilaya_code: str
+    wilaya_name: str
     zone_sismique: str
+    zone_num: int | None = None
+    zone_source: str | None = None
+    lat: Decimal | None = None
+    lon: Decimal | None = None
+    coordinate_source: str | None = None
+    has_coordinates: bool = False
 
 
 class ZoneLookupResponse(BaseModel):
     wilaya_code: str
+    wilaya_name: str | None = None
+    commune_code: str | None = None
     commune: str
     zone: str
+    zone_num: int | None = None
+    zone_source: str | None = None
     description: str
+    lat: Decimal | None = None
+    lon: Decimal | None = None
+    coordinate_source: str | None = None
+    has_coordinates: bool = False
 
 
 class CommuneMapFeature(BaseModel):
-    commune_code: str
+    commune_code: str | None
     commune_name: str
     wilaya_code: str
     wilaya_name: str
     zone_sismique: str
+    zone_source: str | None = None
+    lat: Decimal | None = None
+    lon: Decimal | None = None
+    coordinate_source: str | None = None
+    has_coordinates: bool = False
     total_exposure: Decimal
     policy_count: int
     avg_risk_score: Decimal
@@ -50,9 +73,14 @@ class HotspotData(BaseModel):
     rank: int
     wilaya_code: str
     wilaya_name: str
-    commune_code: str
+    commune_code: str | None
     commune_name: str
     zone_sismique: str
+    zone_source: str | None = None
+    lat: Decimal | None = None
+    lon: Decimal | None = None
+    coordinate_source: str | None = None
+    has_coordinates: bool = False
     total_exposure: Decimal
     policy_count: int
     hotspot_score: Decimal
@@ -81,3 +109,4 @@ class PremiumAdequacyRow(BaseModel):
     premium_gap_pct: Decimal
     policy_count: int
     total_exposure: Decimal
+

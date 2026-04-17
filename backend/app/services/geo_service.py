@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import case, func, literal, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.commune import Commune
 from app.models.policy import Policy
 from app.schemas.geo import (
     CommuneBasic,
@@ -64,26 +65,132 @@ def _quantize(value: Decimal, precision: str = "0.01") -> Decimal:
 
 
 class GeoService:
+    async def list_communes(
+        self,
+        db: AsyncSession,
+        *,
+        wilaya_code: str | None = None,
+        zone_sismique: str | None = None,
+        has_coordinates: bool | None = None,
+    ) -> list[CommuneBasic]:
+        query = select(Commune)
+        if wilaya_code:
+            query = query.where(Commune.wilaya_code == wilaya_code)
+        if zone_sismique:
+            query = query.where(Commune.zone_sismique == zone_sismique)
+        if has_coordinates is not None:
+            query = query.where(Commune.has_coordinates.is_(has_coordinates))
+        query = query.order_by(Commune.wilaya_code.asc(), Commune.commune_name.asc())
+        result = await db.execute(query)
+        return [self._to_commune_basic(commune) for commune in result.scalars().all()]
+
     async def get_wilayas(self, db: AsyncSession) -> list[WilayaBasic]:
         result = await db.execute(
+            select(
+                Commune.wilaya_code,
+                Commune.wilaya_name,
+                func.count(Commune.id),
+            )
+            .group_by(Commune.wilaya_code, Commune.wilaya_name)
+            .order_by(Commune.wilaya_code.asc(), Commune.wilaya_name.asc())
+        )
+        rows = result.all()
+        if rows:
+            return [WilayaBasic(code=code, name=name, commune_count=commune_count) for code, name, commune_count in rows]
+
+        fallback = await db.execute(
             select(Policy.code_wilaya, Policy.wilaya)
             .distinct()
             .order_by(Policy.code_wilaya.asc(), Policy.wilaya.asc())
         )
-        return [WilayaBasic(code=code, name=name) for code, name in result.all()]
+        return [WilayaBasic(code=code, name=name, commune_count=None) for code, name in fallback.all()]
 
     async def get_communes(self, db: AsyncSession, wilaya_code: str) -> list[CommuneBasic]:
         result = await db.execute(
-            select(Policy.code_commune, Policy.commune, Policy.zone_sismique)
+            select(Commune)
+            .where(Commune.wilaya_code == wilaya_code)
+            .order_by(Commune.commune_name.asc())
+        )
+        communes = result.scalars().all()
+        if communes:
+            return [self._to_commune_basic(commune) for commune in communes]
+
+        fallback = await db.execute(
+            select(Policy.code_commune, Policy.commune, Policy.zone_sismique, Policy.wilaya, Policy.code_wilaya)
             .distinct()
             .where(Policy.code_wilaya == wilaya_code)
             .order_by(Policy.commune.asc())
         )
-        return [CommuneBasic(code=code, name=name, zone_sismique=zone) for code, name, zone in result.all()]
+        return [
+            CommuneBasic(
+                code=code,
+                name=name,
+                wilaya_code=code_w,
+                wilaya_name=wilaya_name,
+                zone_sismique=zone,
+                has_coordinates=False,
+            )
+            for code, name, zone, wilaya_name, code_w in fallback.all()
+        ]
+
+    async def get_commune_detail(self, db: AsyncSession, wilaya_code: str, commune_name: str) -> CommuneBasic | None:
+        result = await db.execute(
+            select(Commune)
+            .where(
+                Commune.wilaya_code == wilaya_code,
+                func.lower(Commune.commune_name) == commune_name.strip().lower(),
+            )
+            .limit(1)
+        )
+        commune = result.scalar_one_or_none()
+        if commune:
+            return self._to_commune_basic(commune)
+
+        zone = await self.get_zone(db, wilaya_code, commune_name)
+        if zone is None:
+            return None
+        return CommuneBasic(
+            code=zone.commune_code,
+            name=zone.commune,
+            wilaya_code=zone.wilaya_code,
+            wilaya_name=zone.wilaya_name or "",
+            zone_sismique=zone.zone,
+            zone_num=zone.zone_num,
+            zone_source=zone.zone_source,
+            lat=zone.lat,
+            lon=zone.lon,
+            coordinate_source=zone.coordinate_source,
+            has_coordinates=zone.has_coordinates,
+        )
 
     async def get_zone(self, db: AsyncSession, wilaya_code: str, commune_name: str) -> ZoneLookupResponse | None:
+        commune_result = await db.execute(
+            select(Commune)
+            .where(
+                Commune.wilaya_code == wilaya_code,
+                func.lower(Commune.commune_name) == commune_name.strip().lower(),
+            )
+            .limit(1)
+        )
+        commune = commune_result.scalar_one_or_none()
+        if commune is not None:
+            return ZoneLookupResponse(
+                wilaya_code=commune.wilaya_code,
+                wilaya_name=commune.wilaya_name,
+                commune_code=commune.code_commune,
+                commune=commune.commune_name,
+                zone=commune.zone_sismique,
+                zone_num=commune.zone_num,
+                zone_source=commune.zone_source,
+                description=ZONE_DESCRIPTIONS.get(commune.zone_sismique, "Zone sismique non documentee."),
+                lat=commune.lat,
+                lon=commune.lon,
+                coordinate_source=commune.coordinate_source,
+                has_coordinates=commune.has_coordinates,
+            )
+
         result = await db.execute(
-            select(Policy.commune, Policy.zone_sismique)
+            select(Policy.commune, Policy.zone_sismique, Policy.code_commune, Policy.wilaya)
             .where(
                 Policy.code_wilaya == wilaya_code,
                 func.lower(Policy.commune) == commune_name.strip().lower(),
@@ -93,38 +200,111 @@ class GeoService:
         row = result.first()
         if row is None:
             return None
-        commune, zone = row
+        commune, zone, commune_code, wilaya_name = row
         return ZoneLookupResponse(
             wilaya_code=wilaya_code,
+            wilaya_name=wilaya_name,
+            commune_code=commune_code,
             commune=commune,
             zone=zone,
+            zone_num=None,
+            zone_source=None,
             description=ZONE_DESCRIPTIONS.get(zone, "Zone sismique non documentee."),
+            lat=None,
+            lon=None,
+            coordinate_source=None,
+            has_coordinates=False,
         )
 
     async def get_map_data(self, db: AsyncSession, layer: MapLayer) -> MapDataResponse:
         last_updated = (await db.execute(select(func.max(Policy.updated_at)))).scalar_one_or_none()
-
-        query = select(
-            Policy.code_commune,
-            Policy.commune,
-            Policy.code_wilaya,
-            Policy.wilaya,
-            Policy.zone_sismique,
-            func.count(Policy.id),
-            func.coalesce(func.sum(Policy.capital_assure), 0),
-        ).group_by(
-            Policy.code_commune,
-            Policy.commune,
-            Policy.code_wilaya,
-            Policy.wilaya,
-            Policy.zone_sismique,
-        ).order_by(Policy.code_wilaya.asc(), Policy.commune.asc())
-
-        result = await db.execute(query)
         total_exposure = Decimal((await db.execute(select(func.coalesce(func.sum(Policy.capital_assure), 0)))).scalar_one())
         features: list[CommuneMapFeature] = []
 
-        for commune_code, commune_name, wilaya_code, wilaya_name, zone, policy_count, exposure in result.all():
+        commune_count = (await db.execute(select(func.count(Commune.id)))).scalar_one()
+        if commune_count:
+            policy_agg = (
+                select(
+                    Policy.code_wilaya.label("wilaya_code"),
+                    func.lower(Policy.commune).label("commune_key"),
+                    func.coalesce(func.max(Policy.code_commune), "").label("code_commune"),
+                    func.coalesce(func.max(Policy.wilaya), "").label("wilaya_name"),
+                    func.coalesce(func.count(Policy.id), 0).label("policy_count"),
+                    func.coalesce(func.sum(Policy.capital_assure), 0).label("total_exposure"),
+                )
+                .group_by(Policy.code_wilaya, func.lower(Policy.commune))
+                .subquery()
+            )
+
+            result = await db.execute(
+                select(
+                    Commune.code_commune,
+                    Commune.commune_name,
+                    Commune.wilaya_code,
+                    Commune.wilaya_name,
+                    Commune.zone_sismique,
+                    Commune.zone_source,
+                    Commune.lat,
+                    Commune.lon,
+                    Commune.coordinate_source,
+                    Commune.has_coordinates,
+                    func.coalesce(policy_agg.c.policy_count, 0),
+                    func.coalesce(policy_agg.c.total_exposure, 0),
+                )
+                .select_from(Commune)
+                .outerjoin(
+                    policy_agg,
+                    (policy_agg.c.wilaya_code == Commune.wilaya_code)
+                    & (policy_agg.c.commune_key == func.lower(Commune.commune_name)),
+                )
+                .order_by(Commune.wilaya_code.asc(), Commune.commune_name.asc())
+            )
+            rows = result.all()
+        else:
+            result = await db.execute(
+                select(
+                    Policy.code_commune,
+                    Policy.commune,
+                    Policy.code_wilaya,
+                    Policy.wilaya,
+                    Policy.zone_sismique,
+                    Policy.zone_source,
+                    Policy.lat,
+                    Policy.lon,
+                    Policy.coordinate_source,
+                    case((Policy.lat.is_not(None) & Policy.lon.is_not(None), True), else_=False),
+                    func.count(Policy.id),
+                    func.coalesce(func.sum(Policy.capital_assure), 0),
+                )
+                .group_by(
+                    Policy.code_commune,
+                    Policy.commune,
+                    Policy.code_wilaya,
+                    Policy.wilaya,
+                    Policy.zone_sismique,
+                    Policy.zone_source,
+                    Policy.lat,
+                    Policy.lon,
+                    Policy.coordinate_source,
+                )
+                .order_by(Policy.code_wilaya.asc(), Policy.commune.asc())
+            )
+            rows = result.all()
+
+        for (
+            commune_code,
+            commune_name,
+            wilaya_code,
+            wilaya_name,
+            zone,
+            zone_source,
+            lat,
+            lon,
+            coordinate_source,
+            has_coordinates,
+            policy_count,
+            exposure,
+        ) in rows:
             exposure_dec = Decimal(exposure)
             zone_weight = ZONE_WEIGHTS.get(zone, Decimal("1.00"))
             score_proxy = ZONE_SCORE_PROXY.get(zone, Decimal("50"))
@@ -146,6 +326,11 @@ class GeoService:
                     wilaya_code=wilaya_code,
                     wilaya_name=wilaya_name,
                     zone_sismique=zone,
+                    zone_source=zone_source,
+                    lat=lat,
+                    lon=lon,
+                    coordinate_source=coordinate_source,
+                    has_coordinates=bool(has_coordinates),
                     total_exposure=_quantize(exposure_dec),
                     policy_count=policy_count,
                     avg_risk_score=_quantize(score_proxy),
@@ -168,6 +353,11 @@ class GeoService:
                 commune_code=item.commune_code,
                 commune_name=item.commune_name,
                 zone_sismique=item.zone_sismique,
+                zone_source=item.zone_source,
+                lat=item.lat,
+                lon=item.lon,
+                coordinate_source=item.coordinate_source,
+                has_coordinates=item.has_coordinates,
                 total_exposure=item.total_exposure,
                 policy_count=item.policy_count,
                 hotspot_score=item.hotspot_score,
@@ -271,6 +461,22 @@ class GeoService:
                 multiplier = value
                 break
         return base_rate * multiplier
+
+    def _to_commune_basic(self, commune: Commune) -> CommuneBasic:
+        return CommuneBasic(
+            id=commune.id,
+            code=commune.code_commune,
+            name=commune.commune_name,
+            wilaya_code=commune.wilaya_code,
+            wilaya_name=commune.wilaya_name,
+            zone_sismique=commune.zone_sismique,
+            zone_num=commune.zone_num,
+            zone_source=commune.zone_source,
+            lat=commune.lat,
+            lon=commune.lon,
+            coordinate_source=commune.coordinate_source,
+            has_coordinates=commune.has_coordinates,
+        )
 
 
 geo_service = GeoService()

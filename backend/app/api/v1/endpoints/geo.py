@@ -43,9 +43,36 @@ async def get_wilayas(db: AsyncSession = Depends(get_db)) -> list[WilayaBasic]:
     return await geo_service.get_wilayas(db)
 
 
+@router.get("/communes", response_model=list[CommuneBasic])
+async def list_communes(
+    wilaya_code: str | None = None,
+    zone_sismique: str | None = None,
+    has_coordinates: bool | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> list[CommuneBasic]:
+    return await geo_service.list_communes(
+        db,
+        wilaya_code=wilaya_code,
+        zone_sismique=zone_sismique,
+        has_coordinates=has_coordinates,
+    )
+
+
 @router.get("/wilayas/{wilaya_code}/communes", response_model=list[CommuneBasic])
 async def get_communes(wilaya_code: str, db: AsyncSession = Depends(get_db)) -> list[CommuneBasic]:
     return await geo_service.get_communes(db, wilaya_code)
+
+
+@router.get("/communes/{wilaya_code}/{commune_name}", response_model=CommuneBasic)
+async def get_commune_detail(
+    wilaya_code: str,
+    commune_name: str,
+    db: AsyncSession = Depends(get_db),
+) -> CommuneBasic:
+    commune = await geo_service.get_commune_detail(db, wilaya_code, commune_name)
+    if commune is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Commune not found for wilaya")
+    return commune
 
 
 @router.get("/zone/{wilaya_code}/{commune_name}", response_model=ZoneLookupResponse)
