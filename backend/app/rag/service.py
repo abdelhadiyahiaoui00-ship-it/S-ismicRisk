@@ -85,6 +85,9 @@ class RAGService:
             recommendations=final_recommendations,
             context_sources=self._context_sources(retrieved),
             retrieved_documents=retrieved,
+            generation_mode="gemini" if llm_payload.get("_llm_used") else "fallback",
+            llm_used=bool(llm_payload.get("_llm_used")),
+            llm_error=llm_payload.get("_llm_error"),
         )
 
     async def get_portfolio_analysis(self, db: AsyncSession) -> PortfolioAnalysisResponse:
@@ -348,13 +351,7 @@ class RAGService:
                 )
             )
 
-        if user_query and "biggest risk" in user_query.lower():
-            recommendations = sorted(
-                recommendations,
-                key=lambda item: (item.priority != "HIGH", -item.confidence),
-            )
-
-        return recommendations
+        return self._rank_recommendations_for_query(recommendations, context, user_query)
 
     def _compose_answer(self, query: str, context: dict, recommendations: list[RecommendationItem]) -> str:
         if not recommendations:
@@ -545,7 +542,7 @@ class RAGService:
         retrieved: list[RetrievedDocument],
     ) -> dict:
         if not self.gemini_api_key:
-            return {}
+            return {"_llm_used": False, "_llm_error": "GEMINI_API_KEY is not configured."}
 
         prompt = self._build_gemini_prompt(query, context, recommendations, retrieved)
         url = (
@@ -565,9 +562,12 @@ class RAGService:
                 response.raise_for_status()
             data = response.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
-        except Exception:
-            return {}
+            parsed = json.loads(text)
+            parsed["_llm_used"] = True
+            parsed["_llm_error"] = None
+            return parsed
+        except Exception as exc:
+            return {"_llm_used": False, "_llm_error": str(exc)}
 
     def _build_gemini_prompt(
         self,
@@ -647,3 +647,46 @@ Baseline recommendations:
             except Exception:
                 continue
         return merged or fallback
+
+    def _rank_recommendations_for_query(
+        self,
+        recommendations: list[RecommendationItem],
+        context: dict,
+        user_query: str | None,
+    ) -> list[RecommendationItem]:
+        if not user_query:
+            return recommendations
+
+        intent = self._detect_query_intent(user_query)
+        top_hotspot = context["hotspots"][0] if context["hotspots"] else None
+
+        def score(item: RecommendationItem) -> tuple[float, float]:
+            base = item.confidence
+            if item.priority == "HIGH":
+                base += 0.5
+            elif item.priority == "MEDIUM":
+                base += 0.25
+
+            if intent == "pricing" and item.category == "Tarification":
+                base += 1.0
+            if intent == "reinsurance" and item.category == "Reinsurance":
+                base += 1.0
+            if intent in {"concentration", "location", "biggest_risk"} and item.category == "Concentration":
+                base += 1.0
+            if intent == "biggest_risk" and top_hotspot and top_hotspot.zone_sismique in {"IIb", "III"} and item.category == "Concentration":
+                base += 0.4
+            return (base, item.confidence)
+
+        return sorted(recommendations, key=score, reverse=True)
+
+    def _detect_query_intent(self, query: str) -> str:
+        lowered = query.lower()
+        if any(term in lowered for term in ["reinsurance", "reassurance", "cession", "retention"]):
+            return "reinsurance"
+        if any(term in lowered for term in ["price", "pricing", "prime", "tarif", "underpriced", "sous"]):
+            return "pricing"
+        if any(term in lowered for term in ["overexposed", "over exposed", "concentration", "hotspot", "where"]):
+            return "location"
+        if "biggest risk" in lowered or "main risk" in lowered or "principal risk" in lowered:
+            return "biggest_risk"
+        return "general"

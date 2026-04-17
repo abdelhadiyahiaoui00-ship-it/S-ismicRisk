@@ -39,6 +39,9 @@ class RAGQueryResponse(BaseModel):
     recommendations: list[RecommendationItem]
     context_sources: list[str]
     retrieved_documents: list[RetrievedDocument]
+    generation_mode: str
+    llm_used: bool
+    llm_error: str | None = None
 
 
 class RiskInsight(BaseModel):
@@ -100,4 +103,3 @@ class RAGHealthResponse(BaseModel):
     vector_db_status: str
     knowledge_documents: int
     last_initialized_at: datetime | None = None
-
