@@ -36,8 +36,23 @@ alembic upgrade head
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+5. Import the portfolio dataset:
+
+```bash
+python scripts/import_dataset.py /home/abdelhadi/Downloads/all_in_one_dataset.csv
+```
+
+Main starter endpoints after import:
+
+- `GET /health`
+- `GET /docs`
+- `GET /api/v1/policies`
+- `GET /api/v1/policies/summary`
+- `GET /api/v1/geo/wilayas`
+- `GET /api/v1/geo/wilayas/{code}/communes`
+- `GET /api/v1/geo/zone/{wilaya_code}/{commune_name}`
+
 ## Render
 
 - Build command: `pip install --upgrade pip && pip install -r requirements.txt`
 - Start command: `bash scripts/start.sh`
-

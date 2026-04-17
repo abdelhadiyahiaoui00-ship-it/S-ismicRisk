@@ -1,4 +1,3 @@
-from app.models import all_models
+from app.models.policy import Policy
 
-__all__ = ["all_models"]
-
+__all__ = ["Policy"]

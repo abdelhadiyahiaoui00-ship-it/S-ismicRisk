@@ -1,4 +1,3 @@
-from app.models.base import TimestampMixin
+from app.models.policy import Policy
 
-__all__ = ["TimestampMixin"]
-
+__all__ = ["Policy"]
