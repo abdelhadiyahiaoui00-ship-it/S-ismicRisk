@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -37,6 +38,7 @@ class RAGService:
         self.last_initialized_at: datetime | None = None
         self.gemini_api_key = settings.gemini_api_key.strip()
         self.model_name = settings.gemini_model.strip() or "gemini-2.5-flash"
+        self.model_fallbacks = [model for model in settings.gemini_fallback_models if model]
 
     def initialize(self) -> None:
         self.knowledge_base.initialize()
@@ -558,23 +560,34 @@ class RAGService:
             },
         }
         last_error = None
-        for _ in range(2):
-            try:
-                async with httpx.AsyncClient(timeout=40.0) as client:
-                    response = await client.post(
-                        url,
-                        json=payload,
-                        headers={"x-goog-api-key": self.gemini_api_key, "Content-Type": "application/json"},
-                    )
-                    response.raise_for_status()
-                data = response.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                parsed = self._parse_gemini_json(text)
-                parsed["_llm_used"] = True
-                parsed["_llm_error"] = None
-                return parsed
-            except Exception as exc:
-                last_error = str(exc)
+        models_to_try = [self.model_name, *self.model_fallbacks]
+        for model_name in models_to_try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_name}:generateContent?key={self.gemini_api_key}"
+            )
+            for attempt in range(2):
+                try:
+                    async with httpx.AsyncClient(timeout=40.0) as client:
+                        response = await client.post(
+                            url,
+                            json=payload,
+                            headers={"x-goog-api-key": self.gemini_api_key, "Content-Type": "application/json"},
+                        )
+                        response.raise_for_status()
+                    data = response.json()
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    parsed = self._parse_gemini_json(text)
+                    parsed["_llm_used"] = True
+                    parsed["_llm_error"] = None
+                    parsed["_llm_model"] = model_name
+                    return parsed
+                except Exception as exc:
+                    last_error = f"{model_name}: {exc}"
+                    if "503" in str(exc) and attempt == 0:
+                        await asyncio.sleep(1.2)
+                        continue
+                    break
         return {"_llm_used": False, "_llm_error": last_error}
 
     def _build_gemini_prompt(
@@ -697,6 +710,10 @@ Baseline recommendations:
                 base += 1.0
             if intent == "reinsurance" and item.category == "Reinsurance":
                 base += 1.0
+            if intent == "cost_saving" and item.category in {"Reinsurance", "Concentration"}:
+                base += 0.9
+            if intent == "cost_saving" and item.category == "Tarification":
+                base += 0.35
             if intent in {"concentration", "location", "biggest_risk"} and item.category == "Concentration":
                 base += 1.0
             if intent == "biggest_risk" and top_hotspot and top_hotspot.zone_sismique in {"IIb", "III"} and item.category == "Concentration":
@@ -709,6 +726,8 @@ Baseline recommendations:
         lowered = query.lower()
         if any(term in lowered for term in ["reinsurance", "reassurance", "cession", "retention"]):
             return "reinsurance"
+        if any(term in lowered for term in ["save money", "reduce cost", "cut cost", "econom", "profit", "money"]):
+            return "cost_saving"
         if any(term in lowered for term in ["price", "pricing", "prime", "tarif", "underpriced", "sous"]):
             return "pricing"
         if any(term in lowered for term in ["overexposed", "over exposed", "concentration", "hotspot", "where"]):
