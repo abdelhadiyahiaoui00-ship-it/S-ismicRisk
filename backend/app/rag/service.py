@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
 from uuid import uuid4
 
+import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.policy import Policy
 from app.rag.knowledge_base import HybridKnowledgeBase, KnowledgeDocument
 from app.schemas.geo import HotspotData, PortfolioKPIs, PremiumAdequacyRow
@@ -31,6 +34,8 @@ class RAGService:
     def __init__(self, storage_path: Path):
         self.knowledge_base = HybridKnowledgeBase(storage_path=storage_path)
         self.last_initialized_at: datetime | None = None
+        self.gemini_api_key = settings.gemini_api_key.strip()
+        self.model_name = "gemini-1.5-flash"
 
     def initialize(self) -> None:
         self.knowledge_base.initialize()
@@ -39,9 +44,9 @@ class RAGService:
     async def health(self) -> RAGHealthResponse:
         return RAGHealthResponse(
             status="ok",
-            model_loaded=True,
-            model_provider="heuristic-rag-engine",
-            vector_db_status="hybrid-in-memory-index",
+            model_loaded=bool(self.gemini_api_key),
+            model_provider="gemini-1.5-flash" if self.gemini_api_key else "heuristic-fallback",
+            vector_db_status="hybrid-portfolio-knowledge-index",
             knowledge_documents=self.knowledge_base.count(),
             last_initialized_at=self.last_initialized_at,
         )
@@ -66,15 +71,18 @@ class RAGService:
 
     async def query(self, db: AsyncSession, query: str, top_k: int = 4) -> RAGQueryResponse:
         context = await self._build_context(db)
-        retrieved = self._retrieve_documents(query, context["search_query"], top_k=top_k)
+        retrieved = self._retrieve_documents(query, context, top_k=top_k)
         recommendations = self._build_recommendations(context, retrieved, user_query=query)
-        answer = self._compose_answer(query, context, recommendations)
-        confidence = self._overall_confidence(recommendations)
+        llm_payload = await self._generate_with_gemini(query, context, recommendations, retrieved)
+        answer = llm_payload.get("answer") or self._compose_answer(query, context, recommendations)
+        executive_summary = llm_payload.get("executive_summary") or context["executive_summary"]
+        confidence = float(llm_payload.get("confidence") or self._overall_confidence(recommendations))
+        final_recommendations = self._merge_llm_recommendations(llm_payload.get("recommendations"), recommendations)
         return RAGQueryResponse(
             answer=answer,
-            executive_summary=context["executive_summary"],
+            executive_summary=executive_summary,
             confidence=confidence,
-            recommendations=recommendations,
+            recommendations=final_recommendations,
             context_sources=self._context_sources(retrieved),
             retrieved_documents=retrieved,
         )
@@ -94,7 +102,7 @@ class RAGService:
 
     async def get_risk_insights(self, db: AsyncSession) -> RiskInsightsResponse:
         context = await self._build_context(db)
-        retrieved = self._retrieve_documents("portfolio risk insights overexposure seismic concentration", context["search_query"])
+        retrieved = self._retrieve_documents("portfolio risk insights overexposure seismic concentration", context)
         insights = self._build_risk_insights(context)
         return RiskInsightsResponse(
             generated_at=datetime.now(timezone.utc),
@@ -104,13 +112,20 @@ class RAGService:
 
     async def get_recommendations(self, db: AsyncSession) -> RecommendationsResponse:
         context = await self._build_context(db)
-        retrieved = self._retrieve_documents("portfolio recommendations pricing reinsurance concentration", context["search_query"])
+        retrieved = self._retrieve_documents("portfolio recommendations pricing reinsurance concentration", context)
         recommendations = self._build_recommendations(context, retrieved)
+        llm_payload = await self._generate_with_gemini(
+            "Provide the most important portfolio recommendations.",
+            context,
+            recommendations,
+            retrieved,
+        )
+        recommendations = self._merge_llm_recommendations(llm_payload.get("recommendations"), recommendations)
         return RecommendationsResponse(
             generated_at=datetime.now(timezone.utc),
-            executive_summary=context["executive_summary"],
+            executive_summary=llm_payload.get("executive_summary") or context["executive_summary"],
             recommendations=recommendations,
-            confidence=self._overall_confidence(recommendations),
+            confidence=float(llm_payload.get("confidence") or self._overall_confidence(recommendations)),
             retrieved_documents=retrieved,
         )
 
@@ -129,6 +144,8 @@ class RAGService:
         )
 
         concentration_alerts = self._build_concentration_alerts(kpis, hotspots)
+        top_wilayas = await self._top_wilaya_exposure(db)
+        type_mix = await self._top_risk_types(db)
         search_query = " ".join(
             filter(
                 None,
@@ -147,6 +164,8 @@ class RAGService:
             "premium_adequacy": premium_adequacy,
             "executive_summary": executive_summary,
             "concentration_alerts": concentration_alerts,
+            "top_wilayas": top_wilayas,
+            "top_risk_types": type_mix,
             "search_query": search_query,
         }
 
@@ -166,10 +185,13 @@ class RAGService:
             alerts.append("No commune currently breaches the configured concentration alert thresholds.")
         return alerts
 
-    def _retrieve_documents(self, user_query: str, search_query: str, top_k: int = 4) -> list[RetrievedDocument]:
-        combined_query = f"{user_query} {search_query}".strip()
-        matches = self.knowledge_base.search(combined_query, top_k=top_k)
-        return [
+    def _retrieve_documents(self, user_query: str, context: dict, top_k: int = 4) -> list[RetrievedDocument]:
+        combined_query = f"{user_query} {context['search_query']}".strip()
+        knowledge_matches = self.knowledge_base.search(combined_query, top_k=top_k)
+        portfolio_documents = self._build_portfolio_documents(context)
+        portfolio_matches = self._rank_portfolio_documents(combined_query, portfolio_documents, top_k=top_k)
+
+        merged: list[RetrievedDocument] = [
             RetrievedDocument(
                 source=document.source,
                 title=document.title,
@@ -177,8 +199,11 @@ class RAGService:
                 excerpt=document.content[:260],
                 tags=document.tags,
             )
-            for document, score in matches
+            for document, score in knowledge_matches
         ]
+        merged.extend(portfolio_matches)
+        merged.sort(key=lambda item: item.score, reverse=True)
+        return merged[:top_k]
 
     def _build_risk_insights(self, context: dict) -> list[RiskInsight]:
         kpis: PortfolioKPIs = context["kpis"]
@@ -356,3 +381,269 @@ class RAGService:
     def _fmt_money(self, value: Decimal) -> str:
         return f"{value:,.0f} DZD"
 
+    async def _top_wilaya_exposure(self, db: AsyncSession) -> list[dict]:
+        result = await db.execute(
+            select(
+                Policy.code_wilaya,
+                Policy.wilaya,
+                func.count(Policy.id),
+                func.coalesce(func.sum(Policy.capital_assure), 0),
+            )
+            .group_by(Policy.code_wilaya, Policy.wilaya)
+            .order_by(func.sum(Policy.capital_assure).desc())
+            .limit(5)
+        )
+        return [
+            {
+                "code_wilaya": code,
+                "wilaya": wilaya,
+                "policy_count": policy_count,
+                "total_exposure": Decimal(total_exposure),
+            }
+            for code, wilaya, policy_count, total_exposure in result.all()
+        ]
+
+    async def _top_risk_types(self, db: AsyncSession) -> list[dict]:
+        result = await db.execute(
+            select(
+                Policy.type_risque,
+                func.count(Policy.id),
+                func.coalesce(func.sum(Policy.capital_assure), 0),
+            )
+            .group_by(Policy.type_risque)
+            .order_by(func.sum(Policy.capital_assure).desc())
+            .limit(5)
+        )
+        return [
+            {
+                "type_risque": type_risque,
+                "policy_count": policy_count,
+                "total_exposure": Decimal(total_exposure),
+            }
+            for type_risque, policy_count, total_exposure in result.all()
+        ]
+
+    def _build_portfolio_documents(self, context: dict) -> list[KnowledgeDocument]:
+        documents: list[KnowledgeDocument] = []
+        kpis: PortfolioKPIs = context["kpis"]
+
+        documents.append(
+            KnowledgeDocument(
+                doc_id="portfolio-summary",
+                title="Portfolio summary",
+                source="Portfolio Data",
+                tags=["portfolio", "summary", "exposure"],
+                content=(
+                    f"Gross exposure {kpis.total_exposure} DZD, net retention {kpis.net_retention} DZD, "
+                    f"total policies {kpis.total_policies}. Concentration alerts: {' | '.join(context['concentration_alerts'])}."
+                ),
+            )
+        )
+
+        for zone in kpis.by_zone:
+            documents.append(
+                KnowledgeDocument(
+                    doc_id=f"zone-{zone.zone}",
+                    title=f"Zone {zone.zone} exposure profile",
+                    source="Portfolio Data",
+                    tags=["zone", zone.zone, "exposure"],
+                    content=(
+                        f"Zone {zone.zone} has exposure {zone.exposure} DZD, {zone.policy_count} policies, "
+                        f"and {zone.pct}% of total gross exposure."
+                    ),
+                )
+            )
+
+        for hotspot in context["hotspots"]:
+            documents.append(
+                KnowledgeDocument(
+                    doc_id=f"hotspot-{hotspot.commune_code}",
+                    title=f"Hotspot {hotspot.commune_name}",
+                    source="Portfolio Data",
+                    tags=["hotspot", hotspot.zone_sismique, hotspot.commune_name.lower()],
+                    content=(
+                        f"{hotspot.commune_name} in {hotspot.wilaya_name} has {hotspot.total_exposure} DZD exposure, "
+                        f"{hotspot.policy_count} policies, hotspot score {hotspot.hotspot_score}, "
+                        f"zone {hotspot.zone_sismique}."
+                    ),
+                )
+            )
+
+        for row in context["premium_adequacy"][:10]:
+            documents.append(
+                KnowledgeDocument(
+                    doc_id=f"pricing-{row.zone}-{row.type_risque[:20]}",
+                    title=f"Pricing adequacy {row.zone} {row.type_risque}",
+                    source="Pricing Data",
+                    tags=["pricing", row.zone, row.type_risque.lower()],
+                    content=(
+                        f"{row.type_risque} in zone {row.zone}: observed rate {row.observed_rate}, "
+                        f"adequate rate {row.adequate_rate}, premium gap {row.premium_gap_pct}%, "
+                        f"policy count {row.policy_count}, total exposure {row.total_exposure} DZD."
+                    ),
+                )
+            )
+
+        for wilaya in context["top_wilayas"]:
+            documents.append(
+                KnowledgeDocument(
+                    doc_id=f"wilaya-{wilaya['code_wilaya']}",
+                    title=f"Wilaya {wilaya['wilaya']} exposure",
+                    source="Portfolio Data",
+                    tags=["wilaya", wilaya["wilaya"].lower(), "exposure"],
+                    content=(
+                        f"Wilaya {wilaya['wilaya']} holds {wilaya['total_exposure']} DZD exposure across "
+                        f"{wilaya['policy_count']} policies."
+                    ),
+                )
+            )
+
+        for item in context["top_risk_types"]:
+            documents.append(
+                KnowledgeDocument(
+                    doc_id=f"type-{item['type_risque'][:20]}",
+                    title=f"Risk type {item['type_risque']}",
+                    source="Portfolio Data",
+                    tags=["type_risque", item["type_risque"].lower()],
+                    content=(
+                        f"{item['type_risque']} represents {item['total_exposure']} DZD exposure over "
+                        f"{item['policy_count']} policies."
+                    ),
+                )
+            )
+
+        return documents
+
+    def _rank_portfolio_documents(
+        self,
+        query: str,
+        documents: list[KnowledgeDocument],
+        top_k: int = 4,
+    ) -> list[RetrievedDocument]:
+        query_terms = self.knowledge_base._tokenize(query)
+        scored: list[RetrievedDocument] = []
+        for document in documents:
+            doc_terms = self.knowledge_base._tokenize(f"{document.title} {document.content} {' '.join(document.tags)}")
+            score = self.knowledge_base._hybrid_score(query_terms, doc_terms, document) + 0.15
+            scored.append(
+                RetrievedDocument(
+                    source=document.source,
+                    title=document.title,
+                    score=round(score, 4),
+                    excerpt=document.content[:260],
+                    tags=document.tags,
+                )
+            )
+        scored.sort(key=lambda item: item.score, reverse=True)
+        return scored[:top_k]
+
+    async def _generate_with_gemini(
+        self,
+        query: str,
+        context: dict,
+        recommendations: list[RecommendationItem],
+        retrieved: list[RetrievedDocument],
+    ) -> dict:
+        if not self.gemini_api_key:
+            return {}
+
+        prompt = self._build_gemini_prompt(query, context, recommendations, retrieved)
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.model_name}:generateContent?key={self.gemini_api_key}"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=40.0) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+            data = response.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(text)
+        except Exception:
+            return {}
+
+    def _build_gemini_prompt(
+        self,
+        query: str,
+        context: dict,
+        recommendations: list[RecommendationItem],
+        retrieved: list[RetrievedDocument],
+    ) -> str:
+        kpis: PortfolioKPIs = context["kpis"]
+        premium_rows: list[PremiumAdequacyRow] = context["premium_adequacy"][:5]
+        hotspots: list[HotspotData] = context["hotspots"][:5]
+        return f"""
+You are an expert insurance catastrophe analyst focused on Algerian seismic portfolio risk.
+Answer the user question using the provided portfolio data and retrieved knowledge.
+Return ONLY valid JSON with this exact structure:
+{{
+  "answer": "string",
+  "executive_summary": "string",
+  "confidence": 0.0,
+  "recommendations": [
+    {{
+      "priority": "HIGH|MEDIUM|LOW",
+      "category": "Concentration|Tarification|Reinsurance|Prevention|Growth",
+      "title": "string",
+      "description": "string",
+      "action": "string",
+      "confidence": 0.0,
+      "explanation": "string",
+      "rpa_reference": "string or null",
+      "evidence": ["string"]
+    }}
+  ]
+}}
+
+User question:
+{query}
+
+Portfolio summary:
+- Total exposure: {kpis.total_exposure} DZD
+- Net retention: {kpis.net_retention} DZD
+- Total policies: {kpis.total_policies}
+- Executive summary: {context["executive_summary"]}
+
+Zone breakdown:
+{json.dumps([item.model_dump(mode="json") for item in kpis.by_zone], default=str, ensure_ascii=True)}
+
+Hotspots:
+{json.dumps([item.model_dump(mode="json") for item in hotspots], default=str, ensure_ascii=True)}
+
+Premium adequacy:
+{json.dumps([item.model_dump(mode="json") for item in premium_rows], default=str, ensure_ascii=True)}
+
+Top wilayas:
+{json.dumps(context["top_wilayas"], default=str, ensure_ascii=True)}
+
+Top risk types:
+{json.dumps(context["top_risk_types"], default=str, ensure_ascii=True)}
+
+Retrieved knowledge:
+{json.dumps([item.model_dump(mode="json") for item in retrieved], ensure_ascii=True)}
+
+Baseline recommendations:
+{json.dumps([item.model_dump(mode="json") for item in recommendations], ensure_ascii=True)}
+""".strip()
+
+    def _merge_llm_recommendations(
+        self,
+        llm_recommendations: list[dict] | None,
+        fallback: list[RecommendationItem],
+    ) -> list[RecommendationItem]:
+        if not llm_recommendations:
+            return fallback
+        merged: list[RecommendationItem] = []
+        for item in llm_recommendations:
+            try:
+                merged.append(RecommendationItem.model_validate(item))
+            except Exception:
+                continue
+        return merged or fallback
