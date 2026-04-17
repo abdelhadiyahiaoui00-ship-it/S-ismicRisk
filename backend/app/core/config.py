@@ -1,7 +1,9 @@
 from functools import lru_cache
+from typing import Annotated
 
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic.functional_validators import BeforeValidator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def _normalize_db_url(url: str, *, async_driver: bool) -> str:
@@ -18,6 +20,12 @@ def _normalize_db_url(url: str, *, async_driver: bool) -> str:
         if url.startswith("postgresql+asyncpg://"):
             return url.replace("postgresql+asyncpg://", "postgresql://", 1)
     return url
+
+
+def _parse_cors_origins(value: str | list[str]) -> list[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return value
 
 
 class Settings(BaseSettings):
@@ -61,19 +69,12 @@ class Settings(BaseSettings):
     uploads_dir: str = Field(default="uploads", alias="UPLOADS_DIR")
     heatmaps_dir: str = Field(default="uploads/heatmaps", alias="HEATMAPS_DIR")
 
-    cors_origins: list[str] = Field(
+    cors_origins: Annotated[list[str], NoDecode, BeforeValidator(_parse_cors_origins)] = Field(
         default=["http://localhost:3000", "http://localhost:5173"],
         alias="CORS_ORIGINS",
     )
 
-    @classmethod
-    def _split_origins(cls, value: str | list[str]) -> list[str]:
-        if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
-        return value
-
     def model_post_init(self, __context: object) -> None:
-        self.cors_origins = self._split_origins(self.cors_origins)
         self.database_url = _normalize_db_url(self.database_url, async_driver=True)
         self.alembic_database_url = _normalize_db_url(self.alembic_database_url, async_driver=False)
 
