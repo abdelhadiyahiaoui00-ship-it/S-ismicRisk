@@ -28,7 +28,7 @@ class Policy(TimestampMixin, Base):
     source_code_commune: Mapped[str] = mapped_column(String(20), nullable=True)
     code_commune: Mapped[str] = mapped_column(String(20), index=True, nullable=False)
     commune: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
-    zone_sismique: Mapped[str] = mapped_column(String(4), index=True, nullable=False)
+    zone_sismique: Mapped[str] = mapped_column(String(8), index=True, nullable=False)
 
     capital_assure: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     prime_nette: Mapped[Decimal] = mapped_column(Numeric(18, 3), nullable=False)
