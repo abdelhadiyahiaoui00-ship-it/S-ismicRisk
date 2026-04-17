@@ -73,7 +73,16 @@ class RAGService:
         )
 
     async def query(self, db: AsyncSession, query: str, top_k: int = 4) -> RAGQueryResponse:
-        context = await self._build_context(db)
+        return await self.query_with_extra_context(db, query=query, top_k=top_k, extra_context=None)
+
+    async def query_with_extra_context(
+        self,
+        db: AsyncSession,
+        query: str,
+        top_k: int = 4,
+        extra_context: dict | None = None,
+    ) -> RAGQueryResponse:
+        context = await self._build_context(db, extra_context=extra_context)
         retrieved = self._retrieve_documents(query, context, top_k=top_k)
         recommendations = self._build_recommendations(context, retrieved, user_query=query)
         llm_payload = await self._generate_with_gemini(query, context, recommendations, retrieved)
@@ -86,7 +95,7 @@ class RAGService:
             executive_summary=executive_summary,
             confidence=confidence,
             recommendations=final_recommendations,
-            context_sources=self._context_sources(retrieved),
+            context_sources=self._context_sources(retrieved, context),
             retrieved_documents=retrieved,
             generation_mode="gemini" if llm_payload.get("_llm_used") else "fallback",
             llm_used=bool(llm_payload.get("_llm_used")),
@@ -135,7 +144,7 @@ class RAGService:
             retrieved_documents=retrieved,
         )
 
-    async def _build_context(self, db: AsyncSession) -> dict:
+    async def _build_context(self, db: AsyncSession, extra_context: dict | None = None) -> dict:
         kpis = await geo_service.get_portfolio_kpis(db)
         hotspots = await geo_service.get_hotspots(db, top_n=5)
         premium_adequacy = await geo_service.get_premium_adequacy(db)
@@ -164,7 +173,7 @@ class RAGService:
             )
         )
 
-        return {
+        context = {
             "kpis": kpis,
             "hotspots": hotspots,
             "premium_adequacy": premium_adequacy,
@@ -174,6 +183,30 @@ class RAGService:
             "top_risk_types": type_mix,
             "search_query": search_query,
         }
+        if extra_context:
+            monte_carlo = extra_context.get("monte_carlo")
+            if monte_carlo:
+                context["monte_carlo"] = monte_carlo
+                high_risk_zones = monte_carlo.get("high_risk_zones", [])
+                overexposed_wilayas = monte_carlo.get("overexposed_wilayas", [])
+                summary_bits = [
+                    f"Monte Carlo expected net loss {self._fmt_money(Decimal(str(monte_carlo.get('expected_net_loss', 0))))}",
+                    f"VaR 95 {self._fmt_money(Decimal(str(monte_carlo.get('var_95', 0))))}",
+                    f"Worst case {self._fmt_money(Decimal(str(monte_carlo.get('worst_case_loss', 0))))}",
+                ]
+                context["executive_summary"] = context["executive_summary"] + " " + ". ".join(summary_bits) + "."
+                context["search_query"] = " ".join(
+                    filter(
+                        None,
+                        [
+                            context["search_query"],
+                            "monte carlo simulation",
+                            " ".join(str(item.get("zone_sismique", "")) for item in high_risk_zones[:3]),
+                            " ".join(str(item.get("wilaya_name", "")) for item in overexposed_wilayas[:3]),
+                        ],
+                    )
+                )
+        return context
 
     def _build_concentration_alerts(self, kpis: PortfolioKPIs, hotspots: list[HotspotData]) -> list[str]:
         alerts: list[str] = []
@@ -354,6 +387,87 @@ class RAGService:
                 )
             )
 
+        monte_carlo = context.get("monte_carlo")
+        if monte_carlo:
+            expected_net_loss = Decimal(str(monte_carlo.get("expected_net_loss", 0)))
+            var_95 = Decimal(str(monte_carlo.get("var_95", 0)))
+            worst_case_loss = Decimal(str(monte_carlo.get("worst_case_loss", 0)))
+            high_risk_zones = monte_carlo.get("high_risk_zones", [])
+            overexposed_wilayas = monte_carlo.get("overexposed_wilayas", [])
+
+            if kpis.net_retention > 0 and var_95 > kpis.net_retention * Decimal("0.20"):
+                recommendations.append(
+                    RecommendationItem(
+                        priority="HIGH",
+                        category="Reinsurance",
+                        title="Rebalance catastrophe retention",
+                        description=(
+                            f"Monte Carlo stress shows expected net loss of {self._fmt_money(expected_net_loss)} "
+                            f"and VaR 95 of {self._fmt_money(var_95)}."
+                        ),
+                        action=(
+                            "Review cession structure, add aggregate or occurrence protection, and test a lower net retention "
+                            "for northern seismic corridors."
+                        ),
+                        confidence=0.9,
+                        explanation=(
+                            f"Worst simulated retained loss reaches {self._fmt_money(worst_case_loss)}, which indicates "
+                            "meaningful tail volatility."
+                        ),
+                        rpa_reference=None,
+                        evidence=self._build_evidence(retrieved, count=3),
+                    )
+                )
+
+            if high_risk_zones:
+                top_zone = high_risk_zones[0]
+                recommendations.append(
+                    RecommendationItem(
+                        priority="HIGH" if top_zone.get("zone_sismique") in {"IIb", "III"} else "MEDIUM",
+                        category="Concentration",
+                        title="Reduce simulated zone concentration",
+                        description=(
+                            f"Zone {top_zone.get('zone_sismique')} is the leading simulated loss bucket with "
+                            f"{self._fmt_money(Decimal(str(top_zone.get('expected_loss', 0))))} of expected loss."
+                        ),
+                        action=(
+                            "Slow new writings in the stressed zone, review underwriting appetite, and transfer peak exposure "
+                            "away from the highest-loss zone cluster."
+                        ),
+                        confidence=0.86,
+                        explanation=(
+                            f"The simulation ranks Zone {top_zone.get('zone_sismique')} above other zones for expected loss "
+                            f"across {top_zone.get('policy_count', 0)} affected policies."
+                        ),
+                        rpa_reference="RPA 99 zoning principles",
+                        evidence=self._build_evidence(retrieved, count=3),
+                    )
+                )
+
+            if overexposed_wilayas:
+                top_wilaya = overexposed_wilayas[0]
+                recommendations.append(
+                    RecommendationItem(
+                        priority="MEDIUM",
+                        category="Prevention",
+                        title="Target loss prevention in top wilaya",
+                        description=(
+                            f"{top_wilaya.get('wilaya_name')} leads simulated wilaya losses with "
+                            f"{self._fmt_money(Decimal(str(top_wilaya.get('expected_loss', 0))))} expected loss."
+                        ),
+                        action=(
+                            "Prioritize engineering surveys, stricter construction screening, and portfolio steering for this wilaya."
+                        ),
+                        confidence=0.8,
+                        explanation=(
+                            f"The simulation flags {top_wilaya.get('wilaya_name')} as the most overexposed wilaya "
+                            f"under the selected earthquake scenario."
+                        ),
+                        rpa_reference=None,
+                        evidence=self._build_evidence(retrieved, count=2),
+                    )
+                )
+
         return self._rank_recommendations_for_query(recommendations, context, user_query)
 
     def _compose_answer(self, query: str, context: dict, recommendations: list[RecommendationItem]) -> str:
@@ -368,8 +482,10 @@ class RAGService:
     def _build_evidence(self, retrieved: Iterable[RetrievedDocument], count: int = 2) -> list[str]:
         return [f"{doc.source}: {doc.title}" for doc in list(retrieved)[:count]]
 
-    def _context_sources(self, retrieved: list[RetrievedDocument]) -> list[str]:
+    def _context_sources(self, retrieved: list[RetrievedDocument], context: dict | None = None) -> list[str]:
         sources = {"Portfolio KPIs", "Hotspots", "Premium Adequacy"}
+        if context and context.get("monte_carlo"):
+            sources.add("Monte Carlo Simulation")
         sources.update(f"{doc.source} - {doc.title}" for doc in retrieved)
         return sorted(sources)
 
@@ -512,6 +628,48 @@ class RAGService:
                 )
             )
 
+        monte_carlo = context.get("monte_carlo")
+        if monte_carlo:
+            documents.append(
+                KnowledgeDocument(
+                    doc_id="monte-carlo-summary",
+                    title="Monte Carlo portfolio stress summary",
+                    source="Monte Carlo Simulation",
+                    tags=["simulation", "loss", "var", "stress"],
+                    content=(
+                        f"Scenario {monte_carlo.get('scenario_name')} affects {monte_carlo.get('affected_policies')} policies. "
+                        f"Expected net loss {monte_carlo.get('expected_net_loss')} DZD, VaR 95 {monte_carlo.get('var_95')} DZD, "
+                        f"worst case loss {monte_carlo.get('worst_case_loss')} DZD."
+                    ),
+                )
+            )
+            for zone in monte_carlo.get("high_risk_zones", [])[:5]:
+                documents.append(
+                    KnowledgeDocument(
+                        doc_id=f"simulation-zone-{zone.get('zone_sismique')}",
+                        title=f"Simulated high risk zone {zone.get('zone_sismique')}",
+                        source="Monte Carlo Simulation",
+                        tags=["simulation", "zone", str(zone.get("zone_sismique", "")).lower()],
+                        content=(
+                            f"Zone {zone.get('zone_sismique')} produces {zone.get('expected_loss')} DZD of expected simulated loss "
+                            f"over {zone.get('policy_count')} policies and {zone.get('total_exposure')} DZD exposure."
+                        ),
+                    )
+                )
+            for wilaya in monte_carlo.get("overexposed_wilayas", [])[:5]:
+                documents.append(
+                    KnowledgeDocument(
+                        doc_id=f"simulation-wilaya-{wilaya.get('wilaya_code')}",
+                        title=f"Simulated overexposed wilaya {wilaya.get('wilaya_name')}",
+                        source="Monte Carlo Simulation",
+                        tags=["simulation", "wilaya", str(wilaya.get("wilaya_name", "")).lower()],
+                        content=(
+                            f"{wilaya.get('wilaya_name')} drives {wilaya.get('expected_loss')} DZD of simulated expected loss "
+                            f"across {wilaya.get('policy_count')} affected policies."
+                        ),
+                    )
+                )
+
         return documents
 
     def _rank_portfolio_documents(
@@ -600,6 +758,7 @@ class RAGService:
         kpis: PortfolioKPIs = context["kpis"]
         premium_rows: list[PremiumAdequacyRow] = context["premium_adequacy"][:5]
         hotspots: list[HotspotData] = context["hotspots"][:5]
+        monte_carlo = context.get("monte_carlo")
         return f"""
 You are an expert insurance catastrophe analyst focused on Algerian seismic portfolio risk.
 Answer the user question using the provided portfolio data and retrieved knowledge.
@@ -646,6 +805,9 @@ Top wilayas:
 
 Top risk types:
 {json.dumps(context["top_risk_types"], default=str, ensure_ascii=True)}
+
+Monte Carlo simulation:
+{json.dumps(monte_carlo, default=str, ensure_ascii=True) if monte_carlo else "null"}
 
 Retrieved knowledge:
 {json.dumps([item.model_dump(mode="json") for item in retrieved], ensure_ascii=True)}
