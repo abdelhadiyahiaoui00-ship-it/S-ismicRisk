@@ -17,6 +17,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from app.db.session import AsyncSessionLocal
 from app.models.policy import Policy
+from app.services.algeria_location_reference import get_algeria_location_reference
 
 
 def parse_date(value: str) -> datetime.date:
@@ -49,13 +50,12 @@ def load_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(file))
 
 
-async def import_portfolio(
+def build_policy_rows(
     enriched_file: Path,
     missing_wilaya_file: Path | None,
     unknown_zone_file: Path | None,
-    truncate: bool,
-    batch_size: int,
-) -> tuple[int, int]:
+) -> tuple[list[dict[str, object]], int]:
+    reference = get_algeria_location_reference()
     rows = load_rows(enriched_file)
     supplemental: list[dict[str, str]] = []
     for path in [missing_wilaya_file, unknown_zone_file]:
@@ -97,12 +97,39 @@ async def import_portfolio(
         policy_year = int((row.get("year") or "0").strip() or "0")
         numero_police = (row.get("NUMERO_POLICE") or "").strip()
         type_risque = (row.get("TYPE") or "").strip()
-        commune_name = (row.get("commune_name") or "").strip() or "UNKNOWN"
-        wilaya_code = (row.get("wilaya_code") or "").strip().zfill(2) or "00"
-        wilaya_name = (row.get("wilaya_name") or "").strip() or "UNKNOWN"
+        source_commune_name = (row.get("commune_name") or "").strip() or "UNKNOWN"
+        source_wilaya_code = (row.get("wilaya_code") or "").strip().zfill(2) or "00"
+        source_wilaya_name = (row.get("wilaya_name") or "").strip() or "UNKNOWN"
         zone_sismique = (row.get("zone_sismique") or "").strip() or "UNKNOWN"
         capital_assure = parse_decimal(row.get("VALEUR_ASSURÉE", "")) or Decimal("0")
         prime_nette = parse_decimal(row.get("PRIME_NETTE", "")) or Decimal("0")
+        lat = parse_decimal(row.get("lat", ""))
+        lon = parse_decimal(row.get("lon", ""))
+
+        resolved = reference.resolve(
+            source_commune_name,
+            wilaya_code=source_wilaya_code,
+            wilaya_name=source_wilaya_name,
+            lat=lat,
+            lon=lon,
+            raw_label=row.get("commune_du_risque"),
+        )
+        if resolved is not None:
+            commune_name = resolved.commune.commune_name
+            wilaya_code = resolved.commune.wilaya_code
+            wilaya_name = resolved.commune.wilaya_name
+            code_commune = resolved.commune.code_commune
+            lat = resolved.commune.lat or lat
+            lon = resolved.commune.lon or lon
+            zone_match_method = f"canonical::{resolved.method}"
+            coordinate_source = row.get("coordinate_source") or "canonical_reference"
+        else:
+            commune_name = source_commune_name
+            wilaya_code = source_wilaya_code
+            wilaya_name = source_wilaya_name
+            code_commune = extract_commune_code(row.get("commune_du_risque", ""))
+            zone_match_method = (row.get("zone_match_method") or "").strip() or None
+            coordinate_source = (row.get("coordinate_source") or "").strip() or None
 
         if not numero_police or not type_risque or not policy_year:
             skipped += 1
@@ -131,17 +158,17 @@ async def import_portfolio(
                 "zone_lookup_code_wilaya": wilaya_code if wilaya_code != "00" else None,
                 "wilaya": wilaya_name,
                 "source_code_commune": extract_commune_code(row.get("commune_du_risque", "")),
-                "code_commune": extract_commune_code(row.get("commune_du_risque", "")),
+                "code_commune": code_commune,
                 "commune": commune_name,
                 "zone_sismique": zone_sismique,
                 "capital_assure": capital_assure,
                 "prime_nette": prime_nette,
                 "prime_rate": parse_decimal(row.get("prime_rate", "")),
-                "lat": parse_decimal(row.get("lat", "")),
-                "lon": parse_decimal(row.get("lon", "")),
+                "lat": lat,
+                "lon": lon,
                 "zone_source": (row.get("zone_source") or "").strip() or None,
-                "coordinate_source": (row.get("coordinate_source") or "").strip() or None,
-                "zone_match_method": (row.get("zone_match_method") or "").strip() or None,
+                "coordinate_source": coordinate_source,
+                "zone_match_method": zone_match_method,
                 "zone_num": parse_int(row.get("zone_num", "")),
                 "source_sheet": (row.get("source_sheet") or "").strip() or None,
             }
@@ -158,6 +185,22 @@ async def import_portfolio(
         row["wilaya_zone_policy_count_year"] = wilaya_zone_year_counts[wilaya_zone_key]
         row["wilaya_zone_capital_assure_total_year"] = wilaya_zone_year_exposure[wilaya_zone_key]
 
+    return normalized, skipped
+
+
+async def import_portfolio(
+    enriched_file: Path,
+    missing_wilaya_file: Path | None,
+    unknown_zone_file: Path | None,
+    truncate: bool,
+    batch_size: int,
+) -> tuple[int, int]:
+    normalized, skipped = build_policy_rows(
+        enriched_file,
+        missing_wilaya_file,
+        unknown_zone_file,
+    )
+
     inserted = 0
     async with AsyncSessionLocal() as session:
         if truncate:
@@ -168,13 +211,13 @@ async def import_portfolio(
         for row in normalized:
             batch.append(row)
             if len(batch) >= batch_size:
-                await session.execute(insert(Policy), batch)
+                await session.execute(insert(Policy.__table__), batch)
                 await session.commit()
                 inserted += len(batch)
                 batch.clear()
 
         if batch:
-            await session.execute(insert(Policy), batch)
+            await session.execute(insert(Policy.__table__), batch)
             await session.commit()
             inserted += len(batch)
 
