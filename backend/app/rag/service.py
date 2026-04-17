@@ -30,6 +30,7 @@ from app.schemas.recommendation import (
     RiskInsightsResponse,
 )
 from app.services.geo_service import geo_service
+from app.services.ml_service import ml_service
 
 
 class RAGService:
@@ -148,6 +149,19 @@ class RAGService:
         kpis = await geo_service.get_portfolio_kpis(db)
         hotspots = await geo_service.get_hotspots(db, top_n=5)
         premium_adequacy = await geo_service.get_premium_adequacy(db)
+        try:
+            risk_scores_summary = await ml_service.get_portfolio_score_analytics(db)
+        except Exception:
+            risk_scores_summary = {
+                "high_count": 0,
+                "medium_count": 0,
+                "low_count": 0,
+                "high_pct": 0.0,
+                "avg_score": 0.0,
+                "dominant_factor": None,
+                "commune_average_scores": {},
+                "top_high_risk_communes": [],
+            }
         portfolio_years = await db.execute(select(func.min(Policy.policy_year), func.max(Policy.policy_year)))
         min_year, max_year = portfolio_years.one()
 
@@ -155,7 +169,9 @@ class RAGService:
             f"Portfolio of {kpis.total_policies} policies with gross exposure of {self._fmt_money(kpis.total_exposure)} "
             f"and net retained exposure of {self._fmt_money(kpis.net_retention)}. "
             f"Main concentration sits in {hotspots[0].commune_name if hotspots else 'diversified communes'} "
-            f"and the data currently spans underwriting years {min_year} to {max_year}."
+            f"and the data currently spans underwriting years {min_year} to {max_year}. "
+            f"CatBoost average risk score is {risk_scores_summary.get('avg_score', 0):.1f}/100 with "
+            f"{risk_scores_summary.get('high_count', 0)} high-risk policies."
         )
 
         concentration_alerts = self._build_concentration_alerts(kpis, hotspots)
@@ -177,6 +193,7 @@ class RAGService:
             "kpis": kpis,
             "hotspots": hotspots,
             "premium_adequacy": premium_adequacy,
+            "risk_scores_summary": risk_scores_summary,
             "executive_summary": executive_summary,
             "concentration_alerts": concentration_alerts,
             "top_wilayas": top_wilayas,
@@ -184,6 +201,25 @@ class RAGService:
             "search_query": search_query,
         }
         if extra_context:
+            ml_policy_score = extra_context.get("ml_policy_score")
+            if ml_policy_score:
+                context["ml_policy_score"] = ml_policy_score
+                context["executive_summary"] = (
+                    context["executive_summary"]
+                    + f" Current policy score is {ml_policy_score.get('score', 0)}/100 "
+                    + f"({ml_policy_score.get('tier', 'UNKNOWN')})."
+                )
+                context["search_query"] = " ".join(
+                    filter(
+                        None,
+                        [
+                            context["search_query"],
+                            "catboost score",
+                            ml_policy_score.get("tier"),
+                            ml_policy_score.get("dominant_factor"),
+                        ],
+                    )
+                )
             monte_carlo = extra_context.get("monte_carlo")
             if monte_carlo:
                 context["monte_carlo"] = monte_carlo
@@ -312,6 +348,7 @@ class RAGService:
         kpis: PortfolioKPIs = context["kpis"]
         hotspots: list[HotspotData] = context["hotspots"]
         premium_rows: list[PremiumAdequacyRow] = context["premium_adequacy"]
+        risk_scores_summary = context.get("risk_scores_summary", {})
         recommendations: list[RecommendationItem] = []
 
         if hotspots:
@@ -384,6 +421,55 @@ class RAGService:
                     explanation="Retained losses can accumulate rapidly when multiple policies share the same seismic footprint.",
                     rpa_reference=None,
                     evidence=self._build_evidence(retrieved, count=3),
+                )
+            )
+
+        if risk_scores_summary.get("high_count", 0):
+            recommendations.append(
+                RecommendationItem(
+                    priority="HIGH" if risk_scores_summary.get("high_pct", 0) >= 20 else "MEDIUM",
+                    category="Underwriting",
+                    title="Control high-score policy growth",
+                    description=(
+                        f"CatBoost flags {risk_scores_summary.get('high_count', 0)} policies as HIGH risk "
+                        f"with an average score of {risk_scores_summary.get('avg_score', 0):.1f}/100."
+                    ),
+                    action=(
+                        "Tighten underwriting on the highest-scoring segments, review referral rules, and "
+                        "rebalance production toward lower-score communes and risk types."
+                    ),
+                    confidence=0.87,
+                    explanation=(
+                        f"The dominant CatBoost driver is {risk_scores_summary.get('dominant_factor', 'risk_combination')}, "
+                        "which indicates the current portfolio is carrying concentrated modeled risk."
+                    ),
+                    rpa_reference=None,
+                    evidence=self._build_evidence(retrieved, count=3),
+                )
+            )
+
+        ml_policy_score = context.get("ml_policy_score")
+        if ml_policy_score:
+            recommendations.append(
+                RecommendationItem(
+                    priority="HIGH" if ml_policy_score.get("tier") == "HIGH" else "MEDIUM",
+                    category="Policy",
+                    title="Act on current policy score",
+                    description=(
+                        f"The submitted policy scores {ml_policy_score.get('score', 0)}/100 "
+                        f"with a tier of {ml_policy_score.get('tier', 'UNKNOWN')}."
+                    ),
+                    action=(
+                        "Use the CatBoost result to decide whether to reprice, reduce line size, request engineering review, "
+                        "or route the submission to referral."
+                    ),
+                    confidence=0.9,
+                    explanation=(
+                        f"The dominant modeled driver is {ml_policy_score.get('dominant_factor', 'risk_combination')}, "
+                        "so the recommendation is grounded in the policy-level CatBoost output."
+                    ),
+                    rpa_reference=None,
+                    evidence=self._build_evidence(retrieved, count=2),
                 )
             )
 
@@ -483,9 +569,11 @@ class RAGService:
         return [f"{doc.source}: {doc.title}" for doc in list(retrieved)[:count]]
 
     def _context_sources(self, retrieved: list[RetrievedDocument], context: dict | None = None) -> list[str]:
-        sources = {"Portfolio KPIs", "Hotspots", "Premium Adequacy"}
+        sources = {"Portfolio KPIs", "Hotspots", "Premium Adequacy", "CatBoost Scores"}
         if context and context.get("monte_carlo"):
             sources.add("Monte Carlo Simulation")
+        if context and context.get("ml_policy_score"):
+            sources.add("CatBoost Policy Score")
         sources.update(f"{doc.source} - {doc.title}" for doc in retrieved)
         return sorted(sources)
 
@@ -596,6 +684,52 @@ class RAGService:
                         f"{row.type_risque} in zone {row.zone}: observed rate {row.observed_rate}, "
                         f"adequate rate {row.adequate_rate}, premium gap {row.premium_gap_pct}%, "
                         f"policy count {row.policy_count}, total exposure {row.total_exposure} DZD."
+                    ),
+                )
+            )
+
+        risk_scores_summary = context.get("risk_scores_summary")
+        if risk_scores_summary:
+            documents.append(
+                KnowledgeDocument(
+                    doc_id="catboost-summary",
+                    title="CatBoost portfolio risk summary",
+                    source="CatBoost Scores",
+                    tags=["catboost", "scores", "portfolio", "risk"],
+                    content=(
+                        f"Average portfolio score {risk_scores_summary.get('avg_score', 0):.1f}/100. "
+                        f"HIGH risk policies {risk_scores_summary.get('high_count', 0)}, "
+                        f"MEDIUM {risk_scores_summary.get('medium_count', 0)}, LOW {risk_scores_summary.get('low_count', 0)}. "
+                        f"Dominant model factor {risk_scores_summary.get('dominant_factor', 'risk_combination')}."
+                    ),
+                )
+            )
+            for commune in risk_scores_summary.get("top_high_risk_communes", [])[:5]:
+                documents.append(
+                    KnowledgeDocument(
+                        doc_id=f"catboost-commune-{commune.get('commune_code') or commune.get('commune_name')}",
+                        title=f"High-risk commune {commune.get('commune_name')}",
+                        source="CatBoost Scores",
+                        tags=["catboost", "commune", str(commune.get("wilaya_name", "")).lower()],
+                        content=(
+                            f"{commune.get('commune_name')} in {commune.get('wilaya_name')} has an average CatBoost score of "
+                            f"{commune.get('avg_score')} over {commune.get('policy_count')} policies, with "
+                            f"{commune.get('high_pct')}% of policies in HIGH tier."
+                        ),
+                    )
+                )
+
+        ml_policy_score = context.get("ml_policy_score")
+        if ml_policy_score:
+            documents.append(
+                KnowledgeDocument(
+                    doc_id="catboost-policy-score",
+                    title="Current CatBoost policy score",
+                    source="CatBoost Scores",
+                    tags=["catboost", "policy", str(ml_policy_score.get("tier", "")).lower()],
+                    content=(
+                        f"Current policy score {ml_policy_score.get('score', 0)}/100, tier {ml_policy_score.get('tier')}, "
+                        f"dominant factor {ml_policy_score.get('dominant_factor')}."
                     ),
                 )
             )

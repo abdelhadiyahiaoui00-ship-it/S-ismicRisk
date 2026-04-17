@@ -20,6 +20,7 @@ from app.schemas.geo import (
     ZoneBreakdown,
     ZoneLookupResponse,
 )
+from app.services.ml_service import ml_service
 
 ZONE_DESCRIPTIONS = {
     "0": "Zone de sismicite negligeable.",
@@ -220,6 +221,15 @@ class GeoService:
         last_updated = (await db.execute(select(func.max(Policy.updated_at)))).scalar_one_or_none()
         total_exposure = Decimal((await db.execute(select(func.coalesce(func.sum(Policy.capital_assure), 0)))).scalar_one())
         features: list[CommuneMapFeature] = []
+        score_analytics: dict | None = None
+        commune_scores: dict[tuple[str, str], dict] = {}
+
+        try:
+            score_analytics = await ml_service.get_portfolio_score_analytics(db)
+            commune_scores = score_analytics.get("commune_average_scores", {})
+        except Exception:
+            score_analytics = None
+            commune_scores = {}
 
         commune_count = (await db.execute(select(func.count(Commune.id)))).scalar_one()
         if commune_count:
@@ -312,10 +322,12 @@ class GeoService:
             if total_exposure > 0:
                 hotspot_score = (exposure_dec / total_exposure) * Decimal("100") * zone_weight
 
+            commune_score = commune_scores.get((str(wilaya_code).zfill(2), str(commune_name).strip().lower()))
+            avg_risk_score = Decimal(str(commune_score["avg_score"])) if commune_score else score_proxy
             layer_value = {
                 "risk": score_proxy,
                 "exposure": exposure_dec,
-                "score": score_proxy,
+                "score": avg_risk_score,
                 "simulation": Decimal("0"),
             }[layer]
 
@@ -333,7 +345,7 @@ class GeoService:
                     has_coordinates=bool(has_coordinates),
                     total_exposure=_quantize(exposure_dec),
                     policy_count=policy_count,
-                    avg_risk_score=_quantize(score_proxy),
+                    avg_risk_score=_quantize(avg_risk_score),
                     net_retention=_quantize(exposure_dec * Decimal(str(settings.retention_rate))),
                     hotspot_score=_quantize(hotspot_score),
                     layer_value=_quantize(layer_value),
