@@ -37,6 +37,8 @@ def create_application() -> FastAPI:
         return HealthResponse(status="ok", service="backend", environment=settings.environment)
 
     app.include_router(api_router, prefix=settings.api_v1_prefix)
+    if settings.api_v1_prefix != "/api":
+        app.include_router(api_router, prefix="/api")
     return app
 
 

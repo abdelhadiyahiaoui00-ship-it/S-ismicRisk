@@ -1,11 +1,41 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
-from app.schemas.geo import CommuneBasic, WilayaBasic, ZoneLookupResponse
+from app.schemas.geo import (
+    CommuneBasic,
+    HotspotData,
+    MapDataResponse,
+    MapLayer,
+    PortfolioKPIs,
+    PremiumAdequacyRow,
+    WilayaBasic,
+    ZoneLookupResponse,
+)
 from app.services.geo_service import geo_service
 
 router = APIRouter()
+
+
+@router.get("/map-data", response_model=MapDataResponse)
+async def get_map_data(
+    layer: MapLayer = Query(default="risk"),
+    db: AsyncSession = Depends(get_db),
+) -> MapDataResponse:
+    return await geo_service.get_map_data(db, layer)
+
+
+@router.get("/hotspots", response_model=list[HotspotData])
+async def get_hotspots(
+    top_n: int = Query(default=10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> list[HotspotData]:
+    return await geo_service.get_hotspots(db, top_n)
+
+
+@router.get("/kpis", response_model=PortfolioKPIs)
+async def get_kpis(db: AsyncSession = Depends(get_db)) -> PortfolioKPIs:
+    return await geo_service.get_portfolio_kpis(db)
 
 
 @router.get("/wilayas", response_model=list[WilayaBasic])
@@ -24,3 +54,8 @@ async def get_zone(wilaya_code: str, commune_name: str, db: AsyncSession = Depen
     if zone is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Commune not found for wilaya")
     return zone
+
+
+@router.get("/premium-adequacy", response_model=list[PremiumAdequacyRow])
+async def get_premium_adequacy(db: AsyncSession = Depends(get_db)) -> list[PremiumAdequacyRow]:
+    return await geo_service.get_premium_adequacy(db)
