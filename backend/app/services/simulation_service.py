@@ -157,18 +157,23 @@ class SimulationService:
             affected["mdr_sigma"].to_numpy(dtype=float),
         )
 
-        damage_samples = np.zeros((len(affected), n_sims), dtype=float)
-        for idx, (alpha_value, beta_value) in enumerate(zip(alpha, beta_params)):
-            if alpha_value <= 0 or beta_value <= 0:
-                damage_samples[idx] = float(affected.iloc[idx]["mdr"])
-            else:
-                damage_samples[idx] = rng.beta(alpha_value, beta_value, size=n_sims)
+        gross_losses = np.zeros(n_sims, dtype=np.float64)
+        mean_policy_losses = np.zeros(len(affected), dtype=np.float64)
 
-        insured_values = affected["capital_assure"].to_numpy(dtype=float).reshape(-1, 1)
-        policy_losses = damage_samples * insured_values
-        gross_losses = policy_losses.sum(axis=0)
+        insured_values = affected["capital_assure"].to_numpy(dtype=float)
+        mean_damage_ratios = affected["mdr"].to_numpy(dtype=float)
+
+        for idx, (alpha_value, beta_value, insured_value, mean_damage_ratio) in enumerate(
+            zip(alpha, beta_params, insured_values, mean_damage_ratios)
+        ):
+            if alpha_value <= 0 or beta_value <= 0:
+                sampled_ratios = np.full(n_sims, mean_damage_ratio, dtype=np.float64)
+            else:
+                sampled_ratios = rng.beta(alpha_value, beta_value, size=n_sims)
+            gross_losses += sampled_ratios * insured_value
+            mean_policy_losses[idx] = mean_damage_ratio * insured_value
+
         net_losses = gross_losses * float(settings.retention_rate)
-        mean_policy_losses = policy_losses.mean(axis=1)
 
         per_commune = self._aggregate_by_commune(affected, mean_policy_losses)
         high_risk_zones = self._aggregate_high_risk_zones(affected, mean_policy_losses)
