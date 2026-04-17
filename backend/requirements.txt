@@ -12,3 +12,4 @@ httpx==0.28.1
 numpy==2.3.1
 pandas==2.3.1
 scipy==1.16.0
+catboost==1.2.8

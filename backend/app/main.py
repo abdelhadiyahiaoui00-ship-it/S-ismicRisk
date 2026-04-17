@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core.config import settings
-from app.core.dependencies import get_rag_service
+from app.core.dependencies import get_ml_service, get_rag_service
 from app.schemas.health import HealthResponse, RootResponse
 
 
@@ -40,6 +40,7 @@ def create_application() -> FastAPI:
     @app.on_event("startup")
     async def initialize_services() -> None:
         get_rag_service()
+        get_ml_service()
 
     app.include_router(api_router, prefix=settings.api_v1_prefix)
     if settings.api_v1_prefix != "/api":
