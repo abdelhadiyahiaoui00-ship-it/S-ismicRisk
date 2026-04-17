@@ -88,7 +88,6 @@ class MonteCarloResult(BaseModel):
     var_99: float
     pml_999: float
     worst_case_loss: float
-    distribution_json: list[float]
     per_commune_json: list[CommuneLossEntry]
     high_risk_zones: list[ZoneLossEntry]
     overexposed_wilayas: list[WilayaLossEntry]

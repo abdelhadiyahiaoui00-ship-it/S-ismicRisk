@@ -192,7 +192,6 @@ class SimulationService:
             "var_99": float(np.percentile(net_losses, 99)),
             "pml_999": float(np.percentile(net_losses, 99.9)),
             "worst_case_loss": float(net_losses.max()),
-            "distribution_json": net_losses[:: max(1, n_sims // 500)].tolist(),
             "per_commune_json": per_commune,
             "high_risk_zones": high_risk_zones,
             "overexposed_wilayas": overexposed_wilayas,
