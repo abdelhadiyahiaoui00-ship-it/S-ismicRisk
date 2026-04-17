@@ -1,0 +1,2 @@
+"""Damage AI service placeholder."""
+

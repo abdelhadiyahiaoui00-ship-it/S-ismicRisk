@@ -1,0 +1,61 @@
+services:
+  - type: web
+    name: rased-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: bash scripts/start.sh
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: APP_NAME
+        value: RASED API
+      - key: API_V1_PREFIX
+        value: /api/v1
+      - key: CORS_ORIGINS
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: rased-postgres
+          property: connectionString
+      - key: ALEMBIC_DATABASE_URL
+        fromDatabase:
+          name: rased-postgres
+          property: connectionString
+      - key: REDIS_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: USGS_POLL_INTERVAL
+        value: "60"
+      - key: MIN_ALERT_MAGNITUDE
+        value: "4.0"
+      - key: AUTO_SIMULATE_THRESHOLD
+        value: "5.0"
+      - key: REINSURANCE_CESSION_RATE
+        value: "0.70"
+      - key: RETENTION_RATE
+        value: "0.30"
+      - key: CATBOOST_MODEL_PATH
+        value: ml_models/catboost_model.cbm
+      - key: DAMAGE_CNN_PATH
+        value: ml_models/damage_cnn.pt
+      - key: UPLOADS_DIR
+        value: uploads
+      - key: HEATMAPS_DIR
+        value: uploads/heatmaps
+
+databases:
+  - name: rased-postgres
+    plan: free
+    databaseName: rased_db
+    user: rased_user
+

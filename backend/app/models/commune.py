@@ -1,0 +1,2 @@
+"""Commune ORM model placeholder."""
+
