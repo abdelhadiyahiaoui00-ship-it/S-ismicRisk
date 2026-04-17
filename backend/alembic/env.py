@@ -18,7 +18,9 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-config.set_main_option("sqlalchemy.url", settings.alembic_database_url)
+# Use the async SQLAlchemy URL so Alembic works with the installed `asyncpg`
+# driver and does not require an additional sync driver like `psycopg2`.
+config.set_main_option("sqlalchemy.url", settings.database_url)
 
 
 def run_migrations_offline() -> None:
@@ -65,4 +67,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-
