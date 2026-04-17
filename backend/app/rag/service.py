@@ -35,7 +35,7 @@ class RAGService:
         self.knowledge_base = HybridKnowledgeBase(storage_path=storage_path)
         self.last_initialized_at: datetime | None = None
         self.gemini_api_key = settings.gemini_api_key.strip()
-        self.model_name = "gemini-1.5-flash"
+        self.model_name = settings.gemini_model.strip() or "gemini-2.5-flash"
 
     def initialize(self) -> None:
         self.knowledge_base.initialize()
@@ -558,7 +558,11 @@ class RAGService:
         }
         try:
             async with httpx.AsyncClient(timeout=40.0) as client:
-                response = await client.post(url, json=payload)
+                response = await client.post(
+                    url,
+                    json=payload,
+                    headers={"x-goog-api-key": self.gemini_api_key, "Content-Type": "application/json"},
+                )
                 response.raise_for_status()
             data = response.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"]

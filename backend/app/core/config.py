@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     )
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
 
     usgs_poll_interval: int = Field(default=60, alias="USGS_POLL_INTERVAL")
     min_alert_magnitude: float = Field(default=4.0, alias="MIN_ALERT_MAGNITUDE")
