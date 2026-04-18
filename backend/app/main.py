@@ -22,7 +22,7 @@ def create_application() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origins,
+        allow_origins=[settings.cors_origins, "https://aecnerd.netlify.app"]
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
