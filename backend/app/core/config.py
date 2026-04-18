@@ -76,8 +76,8 @@ class Settings(BaseSettings):
     heatmaps_dir: str = Field(default="uploads/heatmaps", alias="HEATMAPS_DIR")
 
     cors_origins: Annotated[list[str], NoDecode, BeforeValidator(_parse_cors_origins)] = Field(
-        default=["http://localhost:3000", "http://localhost:5173", "https://aecnerd.netlify.app"]
-        alias="CORS_ORIGINS",
+        default=["http://localhost:3000", "http://localhost:5173", "https://aecnerd.netlify.app"],
+        alias="CORS_ORIGINS"
     )
 
     def model_post_init(self, __context: object) -> None:
