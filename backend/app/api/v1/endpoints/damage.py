@@ -71,11 +71,11 @@ async def estimate_damage(
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Damage assessment unavailable: {exc}") from exc
 
-    rag_query = query or "Provide parametric insurance, prevention, and underwriting recommendations based on this damage assessment."
+    rag_query = query or "Provide concise parametric insurance and underwriting recommendations based on this damage assessment."
     rag_response = await rag_service.query_with_extra_context(
         db,
         query=rag_query,
-        top_k=top_k,
+        top_k=max(1, min(top_k, 2)),
         extra_context={"damage_assessment": damage_result},
     )
 

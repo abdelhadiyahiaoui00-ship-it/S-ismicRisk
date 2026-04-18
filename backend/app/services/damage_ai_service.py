@@ -36,6 +36,10 @@ CONSTRUCTION_ALIASES = {
 class DamageAIService:
     DAMAGE_CLASSES = {0: "No Damage", 1: "Minor Damage", 2: "Major Damage", 3: "Destroyed"}
     LOSS_MULTIPLIERS = {0: 0.0, 1: 0.10, 2: 0.45, 3: 0.85}
+    MAX_INFERENCE_DIM = 512
+    MAX_HEATMAP_DIM = 960
+    PATCH_SIZE = 64
+    STRIDE = 64
     DAMAGE_COLORS = {
         0: np.array([0, 255, 0], dtype=np.uint8),
         1: np.array([255, 255, 0], dtype=np.uint8),
@@ -93,6 +97,7 @@ class DamageAIService:
         zone_sismique = self._normalize_zone(zone_sismique)
 
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image = self._prepare_image(image, max_dim=self.MAX_HEATMAP_DIM)
         img_array = np.array(image)
 
         if self.model is not None:
@@ -137,9 +142,10 @@ class DamageAIService:
 
     def _run_model(self, image: Image.Image) -> tuple[dict[str, float], np.ndarray]:
         assert self.model is not None
-        width, height = image.size
-        patch_size = 64
-        stride = 32
+        inference_image = self._prepare_image(image, max_dim=self.MAX_INFERENCE_DIM)
+        width, height = inference_image.size
+        patch_size = self.PATCH_SIZE
+        stride = self.STRIDE
 
         patches: list[torch.Tensor] = []
         coords: list[tuple[int, int, int, int]] = []
@@ -157,15 +163,18 @@ class DamageAIService:
                 if key in seen:
                     continue
                 seen.add(key)
-                crop = image.crop((x, y, min(x + patch_size, width), min(y + patch_size, height))).resize((64, 64))
+                crop = inference_image.crop((x, y, min(x + patch_size, width), min(y + patch_size, height))).resize((64, 64))
                 patches.append(self.transform(crop))
                 coords.append((y, min(y + patch_size, height), x, min(x + patch_size, width)))
 
-        batch = torch.stack(patches).to(self.device)
+        preds_batches: list[np.ndarray] = []
         with torch.no_grad():
-            logits = self.model(batch)
-            probabilities = torch.softmax(logits, dim=1).cpu().numpy()
-            preds = probabilities.argmax(axis=1)
+            for start in range(0, len(patches), 128):
+                batch = torch.stack(patches[start:start + 128]).to(self.device)
+                logits = self.model(batch)
+                probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+                preds_batches.append(probabilities.argmax(axis=1))
+        preds = np.concatenate(preds_batches) if preds_batches else np.array([], dtype=np.int64)
 
         damage_map = np.zeros((height, width), dtype=np.float32)
         count_map = np.zeros((height, width), dtype=np.float32)
@@ -234,6 +243,16 @@ class DamageAIService:
         output_path = self.heatmaps_dir / filename
         image.save(output_path, format="JPEG", quality=88)
         return f"/{settings.heatmaps_dir.rstrip('/')}/{filename}"
+
+    @staticmethod
+    def _prepare_image(image: Image.Image, *, max_dim: int) -> Image.Image:
+        width, height = image.size
+        longest_side = max(width, height)
+        if longest_side <= max_dim:
+            return image
+        scale = max_dim / float(longest_side)
+        resized = image.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.Resampling.BILINEAR)
+        return resized
 
     def _normalize_construction_type(self, value: str | None) -> str:
         normalized = (value or "").strip().upper().replace("É", "E").replace("È", "E").replace("-", " ")
