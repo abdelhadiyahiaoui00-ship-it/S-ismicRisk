@@ -17,7 +17,7 @@ class SimulationRequest(BaseModel):
     depth_km: float = Field(default=10.0, ge=1.0, le=100.0)
     scope: SimulationScope | None = None
     scope_code: str | None = None
-    n_simulations: int = Field(default=10_000, ge=100, le=100_000)
+    n_simulations: int = Field(default=3_000, ge=100, le=20_000)
     seed: int = Field(default=42, ge=1)
     query: str | None = Field(
         default=None,
@@ -78,6 +78,8 @@ class WilayaLossEntry(BaseModel):
 class MonteCarloResult(BaseModel):
     scenario_name: str
     affected_policies: int
+    source_policies: int
+    cleaned_policies: int
     n_simulations: int
     expected_loss: float
     expected_gross_loss: float
@@ -91,6 +93,7 @@ class MonteCarloResult(BaseModel):
     per_commune_json: list[CommuneLossEntry]
     high_risk_zones: list[ZoneLossEntry]
     overexposed_wilayas: list[WilayaLossEntry]
+    data_quality: dict[str, int | float | str] | None = None
     elapsed_seconds: float | None = None
 
 

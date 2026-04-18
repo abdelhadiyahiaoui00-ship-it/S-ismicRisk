@@ -7,10 +7,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.commune import Commune
 from app.models.policy import Policy
 from app.schemas.simulation import SimulationRequest
 from app.services.vulnerability import compute_damage_ratio
@@ -55,13 +56,27 @@ class SimulationService:
 
     async def run(self, db: AsyncSession, request: SimulationRequest) -> dict[str, Any]:
         started = time.perf_counter()
-        portfolio = await self._load_portfolio_from_db(db)
-        result = await asyncio.to_thread(self._run_sync, request, portfolio)
+        scenario = self._resolve_scenario(request)
+        portfolio, quality = await self._load_portfolio_from_db(db, request, scenario)
+        result = await asyncio.to_thread(self._run_sync, request, scenario, portfolio, quality)
         result["elapsed_seconds"] = round(time.perf_counter() - started, 2)
         return result
 
-    async def _load_portfolio_from_db(self, db: AsyncSession) -> pd.DataFrame:
-        result = await db.execute(
+    async def _load_portfolio_from_db(
+        self,
+        db: AsyncSession,
+        request: SimulationRequest,
+        scenario: ScenarioDefinition,
+    ) -> tuple[pd.DataFrame, dict[str, int | float | str]]:
+        commune_match = (
+            (Commune.wilaya_code == Policy.code_wilaya)
+            & (
+                ((Commune.code_commune.is_not(None)) & (Commune.code_commune == Policy.code_commune))
+                | (func.lower(Commune.commune_name) == func.lower(Policy.commune))
+            )
+        )
+
+        query = (
             select(
                 Policy.id,
                 Policy.numero_police,
@@ -71,15 +86,37 @@ class SimulationService:
                 Policy.wilaya,
                 Policy.code_commune,
                 Policy.commune,
-                Policy.zone_sismique,
+                func.coalesce(Commune.zone_sismique, Policy.zone_sismique).label("zone_sismique"),
                 Policy.capital_assure,
                 Policy.prime_nette,
                 Policy.prime_rate,
-                Policy.lat,
-                Policy.lon,
+                func.coalesce(Commune.lat, Policy.lat).label("lat"),
+                func.coalesce(Commune.lon, Policy.lon).label("lon"),
             )
+            .select_from(Policy)
+            .outerjoin(Commune, commune_match)
+            .where(Policy.capital_assure > 0)
+        )
+
+        if request.scope == "wilaya" and request.scope_code:
+            query = query.where(Policy.code_wilaya == request.scope_code.zfill(2))
+        elif request.scope == "commune" and request.scope_code:
+            normalized = request.scope_code.strip().lower()
+            query = query.where(
+                (func.lower(Policy.code_commune) == normalized)
+                | (func.lower(Policy.commune) == normalized)
+                | (func.lower(Commune.code_commune) == normalized)
+                | (func.lower(Commune.commune_name) == normalized)
+            )
+
+        if scenario.affected_wilayas:
+            query = query.where(Policy.code_wilaya.in_(scenario.affected_wilayas))
+
+        result = await db.execute(
+            query
         )
         rows = result.all()
+        source_policies = len(rows)
         data = []
         for row in rows:
             data.append(
@@ -105,14 +142,43 @@ class SimulationService:
 
         frame = pd.DataFrame(data)
         if frame.empty:
-            return frame
+            return frame, {
+                "source_policies": 0,
+                "cleaned_policies": 0,
+                "dropped_missing_coordinates": 0,
+                "dropped_unknown_zone": 0,
+                "dropped_out_of_bounds": 0,
+                "deduplicated_rows": 0,
+            }
 
         frame["capital_assure"] = pd.to_numeric(frame["capital_assure"], errors="coerce").fillna(0.0)
         frame = frame[frame["capital_assure"] > 0].copy()
+        before_missing = len(frame)
         frame = frame.dropna(subset=["lat", "lon"]).copy()
+        dropped_missing_coordinates = before_missing - len(frame)
         frame["wilaya_code"] = frame["wilaya_code"].astype(str).str.zfill(2)
         frame["zone_sismique"] = frame["zone_sismique"].fillna("UNKNOWN")
-        return frame
+        before_zone = len(frame)
+        frame = frame[frame["zone_sismique"].isin({"0", "I", "IIa", "IIb", "III"})].copy()
+        dropped_unknown_zone = before_zone - len(frame)
+        before_bounds = len(frame)
+        frame = frame[
+            frame["lat"].between(18.0, 38.5)
+            & frame["lon"].between(-9.5, 12.5)
+        ].copy()
+        dropped_out_of_bounds = before_bounds - len(frame)
+        before_dedup = len(frame)
+        frame = frame.drop_duplicates(subset=["policy_id"]).copy()
+        deduplicated_rows = before_dedup - len(frame)
+        quality = {
+            "source_policies": source_policies,
+            "cleaned_policies": int(len(frame)),
+            "dropped_missing_coordinates": int(dropped_missing_coordinates),
+            "dropped_unknown_zone": int(dropped_unknown_zone),
+            "dropped_out_of_bounds": int(dropped_out_of_bounds),
+            "deduplicated_rows": int(deduplicated_rows),
+        }
+        return frame, quality
 
     def list_scenarios(self) -> dict[str, dict[str, Any]]:
         return {
@@ -126,31 +192,39 @@ class SimulationService:
             for key, value in self.SCENARIOS.items()
         }
 
-    def _run_sync(self, request: SimulationRequest, portfolio_df: pd.DataFrame) -> dict[str, Any]:
-        scenario = self._resolve_scenario(request)
+    def _run_sync(
+        self,
+        request: SimulationRequest,
+        scenario: ScenarioDefinition,
+        portfolio_df: pd.DataFrame,
+        quality: dict[str, int | float | str],
+    ) -> dict[str, Any]:
         affected = self._get_affected_policies(portfolio_df, scenario, request.scope, request.scope_code)
         if affected.empty:
             return {"error": "No policies in affected area", "affected_policies": 0}
 
         affected = affected.copy()
-        affected["site_pga"] = affected.apply(
-            lambda row: self._compute_site_pga(
-                float(row["lat"]),
-                float(row["lon"]),
-                scenario.epicenter,
-                scenario.magnitude,
-                scenario.depth_km,
-            ),
-            axis=1,
+        site_pga = self._compute_site_pga_vectorized(
+            affected["lat"].to_numpy(dtype=float),
+            affected["lon"].to_numpy(dtype=float),
+            scenario.epicenter,
+            scenario.magnitude,
+            scenario.depth_km,
         )
-        affected["mdr"], affected["mdr_sigma"] = zip(
-            *affected.apply(
-                lambda row: compute_damage_ratio(float(row["site_pga"]), str(row.get("construction_type", "Inconnu"))),
-                axis=1,
-            )
-        )
+        affected["site_pga"] = np.clip(site_pga, 0.0, 1.5)
+        mdr_values: list[float] = []
+        sigma_values: list[float] = []
+        for pga, construction_type in zip(
+            affected["site_pga"].to_numpy(dtype=float),
+            affected["construction_type"].astype(str).to_numpy(),
+        ):
+            mean_ratio, sigma = compute_damage_ratio(float(pga), construction_type)
+            mdr_values.append(mean_ratio)
+            sigma_values.append(sigma)
+        affected["mdr"] = np.clip(np.asarray(mdr_values, dtype=float), 0.0, 0.95)
+        affected["mdr_sigma"] = np.clip(np.asarray(sigma_values, dtype=float), 0.005, 0.20)
 
-        n_sims = request.n_simulations or 10_000
+        n_sims = min(request.n_simulations or 3_000, 20_000)
         rng = np.random.default_rng(seed=request.seed or 42)
         alpha, beta_params = self._moments_to_beta_params(
             affected["mdr"].to_numpy(dtype=float),
@@ -170,6 +244,9 @@ class SimulationService:
                 sampled_ratios = np.full(n_sims, mean_damage_ratio, dtype=np.float64)
             else:
                 sampled_ratios = rng.beta(alpha_value, beta_value, size=n_sims)
+            lower = max(0.0, mean_damage_ratio - 3 * float(affected.iloc[idx]["mdr_sigma"]))
+            upper = min(0.98, mean_damage_ratio + 3 * float(affected.iloc[idx]["mdr_sigma"]))
+            sampled_ratios = np.clip(sampled_ratios, lower, upper)
             gross_losses += sampled_ratios * insured_value
             mean_policy_losses[idx] = mean_damage_ratio * insured_value
 
@@ -182,6 +259,8 @@ class SimulationService:
         return {
             "scenario_name": scenario.label,
             "affected_policies": int(len(affected)),
+            "source_policies": int(quality.get("source_policies", len(portfolio_df))),
+            "cleaned_policies": int(quality.get("cleaned_policies", len(portfolio_df))),
             "n_simulations": int(n_sims),
             "expected_loss": float(net_losses.mean()),
             "expected_gross_loss": float(gross_losses.mean()),
@@ -195,6 +274,7 @@ class SimulationService:
             "per_commune_json": per_commune,
             "high_risk_zones": high_risk_zones,
             "overexposed_wilayas": overexposed_wilayas,
+            "data_quality": quality,
         }
 
     def _resolve_scenario(self, request: SimulationRequest) -> ScenarioDefinition:
@@ -219,17 +299,17 @@ class SimulationService:
         if scenario.affected_wilayas:
             affected = portfolio[portfolio["wilaya_code"].isin(scenario.affected_wilayas)].copy()
         else:
-            radius_km = 30 * np.exp(0.5 * scenario.magnitude)
-            distances = portfolio.apply(
-                lambda row: self._haversine_km(
-                    float(row["lat"]),
-                    float(row["lon"]),
-                    scenario.epicenter[0],
-                    scenario.epicenter[1],
-                ),
-                axis=1,
-            )
-            affected = portfolio[distances <= radius_km].copy()
+            affected = portfolio.copy()
+
+        radius_km = self._impact_radius_km(scenario.magnitude)
+        distances = self._haversine_km_vectorized(
+            affected["lat"].to_numpy(dtype=float),
+            affected["lon"].to_numpy(dtype=float),
+            scenario.epicenter[0],
+            scenario.epicenter[1],
+        )
+        affected = affected[distances <= radius_km].copy()
+        affected["distance_km"] = distances[distances <= radius_km]
 
         if scope == "wilaya" and scope_code:
             affected = affected[affected["wilaya_code"] == scope_code.zfill(2)]
@@ -241,6 +321,42 @@ class SimulationService:
             ]
         return affected
 
+    def _compute_site_pga_vectorized(
+        self,
+        site_lat: np.ndarray,
+        site_lon: np.ndarray,
+        epicenter: tuple[float, float],
+        magnitude: float,
+        depth_km: float,
+    ) -> np.ndarray:
+        distance_epi = self._haversine_km_vectorized(site_lat, site_lon, epicenter[0], epicenter[1])
+        effective_distance = np.sqrt(distance_epi**2 + depth_km**2)
+        b1, b2, b3 = 1.647, 0.767, -0.074
+        b4, b5 = -2.369, 0.169
+        ln_pga = b1 + b2 * magnitude + b3 * magnitude**2 + (b4 + b5 * magnitude) * np.log(np.maximum(effective_distance, 1))
+        pga_rock = np.clip(np.exp(ln_pga), 0.0, 2.0)
+        site_factor = np.where(distance_epi < 50, 1.3, 1.0)
+        return pga_rock * site_factor
+
+    def _haversine_km_vectorized(
+        self,
+        lat1: np.ndarray,
+        lon1: np.ndarray,
+        lat2: float,
+        lon2: float,
+    ) -> np.ndarray:
+        earth_radius_km = 6371.0
+        dlat = np.radians(lat2 - lat1)
+        dlon = np.radians(lon2 - lon1)
+        a = (
+            np.sin(dlat / 2) ** 2
+            + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon / 2) ** 2
+        )
+        return earth_radius_km * 2 * np.arcsin(np.sqrt(a))
+
+    def _impact_radius_km(self, magnitude: float) -> float:
+        return float(np.clip(25 * np.exp(0.42 * magnitude), 80.0, 420.0))
+
     def _compute_site_pga(
         self,
         site_lat: float,
@@ -249,14 +365,15 @@ class SimulationService:
         magnitude: float,
         depth_km: float,
     ) -> float:
-        distance_epi = self._haversine_km(site_lat, site_lon, epicenter[0], epicenter[1])
-        effective_distance = np.sqrt(distance_epi**2 + depth_km**2)
-        b1, b2, b3 = 1.647, 0.767, -0.074
-        b4, b5 = -2.369, 0.169
-        ln_pga = b1 + b2 * magnitude + b3 * magnitude**2 + (b4 + b5 * magnitude) * np.log(max(effective_distance, 1))
-        pga_rock = float(np.clip(np.exp(ln_pga), 0.0, 2.0))
-        site_factor = 1.3 if distance_epi < 50 else 1.0
-        return pga_rock * site_factor
+        return float(
+            self._compute_site_pga_vectorized(
+                np.asarray([site_lat], dtype=float),
+                np.asarray([site_lon], dtype=float),
+                epicenter,
+                magnitude,
+                depth_km,
+            )[0]
+        )
 
     def _moments_to_beta_params(self, means: np.ndarray, stds: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         means = np.clip(means, 0.001, 0.999)
@@ -280,7 +397,7 @@ class SimulationService:
             .reset_index()
             .sort_values("expected_loss", ascending=False)
         )
-        return aggregate.to_dict(orient="records")
+        return aggregate.head(100).to_dict(orient="records")
 
     def _aggregate_high_risk_zones(self, affected: pd.DataFrame, mean_losses: np.ndarray) -> list[dict[str, Any]]:
         frame = affected.copy()
