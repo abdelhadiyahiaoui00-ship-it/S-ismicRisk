@@ -23,7 +23,8 @@ def get_ml_service() -> MLService:
 
 @lru_cache
 def get_damage_ai_service() -> DamageAIService:
-    damage_ai_service.load_model()
+    if damage_ai_service.cnn_enabled:
+        damage_ai_service.load_model()
     return damage_ai_service
 
 

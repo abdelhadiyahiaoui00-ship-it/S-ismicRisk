@@ -6,20 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torchvision.transforms as T
 from PIL import Image
-from torchvision.models import mobilenet_v3_small
 
 from app.core.config import settings
-
-
-def build_model() -> nn.Module:
-    model = mobilenet_v3_small(weights=None)
-    in_features = model.classifier[-1].in_features
-    model.classifier[-1] = nn.Linear(in_features, 4)
-    return model
 
 
 CONSTRUCTION_ALIASES = {
@@ -48,10 +37,36 @@ class DamageAIService:
     }
 
     def __init__(self) -> None:
-        self.model: nn.Module | None = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model: Any | None = None
+        self.device = "cpu"
         self.model_path = Path(__file__).resolve().parents[1] / "ml_models" / Path(settings.damage_cnn_path).name
         self.heatmaps_dir = Path(__file__).resolve().parents[2] / settings.heatmaps_dir
+        self.transform = None
+        self.cnn_enabled = settings.enable_damage_cnn
+        self.load_error: str | None = None
+
+    def load_model(self) -> None:
+        if self.model is not None:
+            return
+        if not self.cnn_enabled:
+            self.load_error = "Damage CNN disabled by configuration."
+            return
+        if not self.model_path.exists():
+            self.load_error = f"Missing model file: {self.model_path}"
+            return
+
+        import torch
+        import torch.nn as nn
+        import torchvision.transforms as T
+        from torchvision.models import mobilenet_v3_small
+
+        def build_model() -> nn.Module:
+            model = mobilenet_v3_small(weights=None)
+            in_features = model.classifier[-1].in_features
+            model.classifier[-1] = nn.Linear(in_features, 4)
+            return model
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.transform = T.Compose(
             [
                 T.Resize((64, 64)),
@@ -59,19 +74,13 @@ class DamageAIService:
                 T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
-
-    def load_model(self) -> None:
-        if self.model is not None:
-            return
-        if not self.model_path.exists():
-            return
-
         model = build_model()
         state_dict = torch.load(self.model_path, map_location=self.device)
         model.load_state_dict(state_dict)
         model.to(self.device)
         model.eval()
         self.model = model
+        self.load_error = None
 
     def health(self) -> dict[str, Any]:
         return {
@@ -79,6 +88,8 @@ class DamageAIService:
             "model_loaded": self.model is not None,
             "device": str(self.device),
             "model_path": str(self.model_path),
+            "cnn_enabled": self.cnn_enabled,
+            "load_error": self.load_error,
         }
 
     def estimate_damage(
@@ -142,6 +153,8 @@ class DamageAIService:
 
     def _run_model(self, image: Image.Image) -> tuple[dict[str, float], np.ndarray]:
         assert self.model is not None
+        import torch
+
         inference_image = self._prepare_image(image, max_dim=self.MAX_INFERENCE_DIM)
         width, height = inference_image.size
         patch_size = self.PATCH_SIZE
@@ -164,6 +177,8 @@ class DamageAIService:
                     continue
                 seen.add(key)
                 crop = inference_image.crop((x, y, min(x + patch_size, width), min(y + patch_size, height))).resize((64, 64))
+                if self.transform is None:
+                    raise RuntimeError("Damage transform not initialized.")
                 patches.append(self.transform(crop))
                 coords.append((y, min(y + patch_size, height), x, min(x + patch_size, width)))
 

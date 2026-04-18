@@ -70,6 +70,7 @@ class Settings(BaseSettings):
 
     catboost_model_path: str = Field(default="ml_models/catboost_model.cbm", alias="CATBOOST_MODEL_PATH")
     damage_cnn_path: str = Field(default="ml_models/damage_cnn.pt", alias="DAMAGE_CNN_PATH")
+    enable_damage_cnn: bool = Field(default=False, alias="ENABLE_DAMAGE_CNN")
 
     uploads_dir: str = Field(default="uploads", alias="UPLOADS_DIR")
     heatmaps_dir: str = Field(default="uploads/heatmaps", alias="HEATMAPS_DIR")

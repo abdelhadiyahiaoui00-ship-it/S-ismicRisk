@@ -54,3 +54,5 @@ class DamageHealthResponse(BaseModel):
     model_loaded: bool
     device: str
     model_path: str
+    cnn_enabled: bool
+    load_error: str | None = None
