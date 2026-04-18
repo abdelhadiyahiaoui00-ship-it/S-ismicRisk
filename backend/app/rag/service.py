@@ -149,19 +149,7 @@ class RAGService:
         kpis = await geo_service.get_portfolio_kpis(db)
         hotspots = await geo_service.get_hotspots(db, top_n=5)
         premium_adequacy = await geo_service.get_premium_adequacy(db)
-        try:
-            risk_scores_summary = await ml_service.get_portfolio_score_analytics(db)
-        except Exception:
-            risk_scores_summary = {
-                "high_count": 0,
-                "medium_count": 0,
-                "low_count": 0,
-                "high_pct": 0.0,
-                "avg_score": 0.0,
-                "dominant_factor": None,
-                "commune_average_scores": {},
-                "top_high_risk_communes": [],
-            }
+        risk_scores_summary = ml_service.get_cached_portfolio_score_analytics()
         portfolio_years = await db.execute(select(func.min(Policy.policy_year), func.max(Policy.policy_year)))
         min_year, max_year = portfolio_years.one()
 
@@ -847,7 +835,7 @@ class RAGService:
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.2,
+                "temperature": 0.1,
                 "responseMimeType": "application/json",
             },
         }
@@ -858,9 +846,9 @@ class RAGService:
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model_name}:generateContent?key={self.gemini_api_key}"
             )
-            for attempt in range(2):
+            for attempt in range(1):
                 try:
-                    async with httpx.AsyncClient(timeout=40.0) as client:
+                    async with httpx.AsyncClient(timeout=15.0) as client:
                         response = await client.post(
                             url,
                             json=payload,
@@ -876,9 +864,6 @@ class RAGService:
                     return parsed
                 except Exception as exc:
                     last_error = f"{model_name}: {exc}"
-                    if "503" in str(exc) and attempt == 0:
-                        await asyncio.sleep(1.2)
-                        continue
                     break
         return {"_llm_used": False, "_llm_error": last_error}
 

@@ -221,15 +221,14 @@ class GeoService:
         last_updated = (await db.execute(select(func.max(Policy.updated_at)))).scalar_one_or_none()
         total_exposure = Decimal((await db.execute(select(func.coalesce(func.sum(Policy.capital_assure), 0)))).scalar_one())
         features: list[CommuneMapFeature] = []
-        score_analytics: dict | None = None
         commune_scores: dict[tuple[str, str], dict] = {}
 
-        try:
-            score_analytics = await ml_service.get_portfolio_score_analytics(db)
-            commune_scores = score_analytics.get("commune_average_scores", {})
-        except Exception:
-            score_analytics = None
-            commune_scores = {}
+        if layer == "score":
+            try:
+                score_analytics = await ml_service.get_portfolio_score_analytics(db)
+                commune_scores = score_analytics.get("commune_average_scores", {})
+            except Exception:
+                commune_scores = {}
 
         commune_count = (await db.execute(select(func.count(Commune.id)))).scalar_one()
         if commune_count:

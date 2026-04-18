@@ -34,6 +34,21 @@ class MLService:
         self._score_analytics_cache_key: str | None = None
         self._score_analytics_cache: dict[str, Any] | None = None
 
+    def empty_score_analytics(self) -> dict[str, Any]:
+        return {
+            "high_count": 0,
+            "medium_count": 0,
+            "low_count": 0,
+            "high_pct": 0.0,
+            "avg_score": 0.0,
+            "dominant_factor": None,
+            "commune_average_scores": {},
+            "top_high_risk_communes": [],
+        }
+
+    def get_cached_portfolio_score_analytics(self) -> dict[str, Any]:
+        return self._score_analytics_cache or self.empty_score_analytics()
+
     def load_models(self) -> None:
         if self.model is not None:
             return
@@ -226,16 +241,7 @@ class MLService:
 
     def _compute_score_analytics(self, policies: list[dict[str, Any]]) -> dict[str, Any]:
         if not policies:
-            return {
-                "high_count": 0,
-                "medium_count": 0,
-                "low_count": 0,
-                "high_pct": 0.0,
-                "avg_score": 0.0,
-                "dominant_factor": None,
-                "commune_average_scores": {},
-                "top_high_risk_communes": [],
-            }
+            return self.empty_score_analytics()
 
         factor_counts: Counter[str] = Counter()
         commune_buckets: dict[tuple[str, str], dict[str, Any]] = defaultdict(

@@ -33,7 +33,7 @@ async def score_policy(
 ) -> PolicyScoreResponse:
     try:
         result = ml_service.score_policy(payload)
-        score_analytics = await ml_service.get_portfolio_score_analytics(db)
+        score_analytics = ml_service.get_cached_portfolio_score_analytics()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"CatBoost scoring unavailable: {exc}") from exc
 
