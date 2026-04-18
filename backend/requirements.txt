@@ -13,3 +13,6 @@ numpy==2.3.1
 pandas==2.3.1
 scipy==1.16.0
 catboost==1.2.8
+Pillow==11.2.1
+torch==2.7.1
+torchvision==0.22.1

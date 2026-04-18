@@ -49,7 +49,7 @@ class RAGService:
         return RAGHealthResponse(
             status="ok",
             model_loaded=bool(self.gemini_api_key),
-            model_provider="gemini-1.5-flash" if self.gemini_api_key else "heuristic-fallback",
+            model_provider=self.model_name if self.gemini_api_key else "heuristic-fallback",
             vector_db_status="hybrid-portfolio-knowledge-index",
             knowledge_documents=self.knowledge_base.count(),
             last_initialized_at=self.last_initialized_at,
@@ -227,6 +227,31 @@ class RAGService:
                             "monte carlo simulation",
                             " ".join(str(item.get("zone_sismique", "")) for item in high_risk_zones[:3]),
                             " ".join(str(item.get("wilaya_name", "")) for item in overexposed_wilayas[:3]),
+                        ],
+                    )
+                )
+            damage_assessment = extra_context.get("damage_assessment")
+            if damage_assessment:
+                context["damage_assessment"] = damage_assessment
+                summary_bits = [
+                    f"Damage assessment indicates {damage_assessment.get('damage_label', 'Unknown damage')}",
+                    f"loss ratio {float(damage_assessment.get('loss_percentage', 0)) * 100:.1f}%",
+                    f"estimated total loss {self._fmt_money(Decimal(str(damage_assessment.get('total_loss_dzd', 0))))}",
+                ]
+                commune_label = damage_assessment.get("commune_name")
+                if commune_label:
+                    summary_bits.insert(0, f"Commune {commune_label}")
+                context["executive_summary"] = context["executive_summary"] + " " + ". ".join(summary_bits) + "."
+                context["search_query"] = " ".join(
+                    filter(
+                        None,
+                        [
+                            context["search_query"],
+                            "parametric damage assessment",
+                            str(damage_assessment.get("zone_sismique", "")),
+                            str(damage_assessment.get("construction_type", "")),
+                            str(damage_assessment.get("damage_label", "")),
+                            str(damage_assessment.get("commune_name", "")),
                         ],
                     )
                 )
@@ -542,6 +567,59 @@ class RAGService:
                     )
                 )
 
+        damage_assessment = context.get("damage_assessment")
+        if damage_assessment:
+            loss_pct = float(damage_assessment.get("loss_percentage", 0)) * 100
+            total_loss = Decimal(str(damage_assessment.get("total_loss_dzd", 0)))
+            damage_label = damage_assessment.get("damage_label", "Unknown damage")
+            zone = damage_assessment.get("zone_sismique", "IIa")
+            commune = damage_assessment.get("commune_name") or "the assessed area"
+            recommendations.append(
+                RecommendationItem(
+                    priority="HIGH" if loss_pct >= 40 else "MEDIUM",
+                    category="Prevention",
+                    title="Act on damage assessment",
+                    description=(
+                        f"{commune} shows {damage_label.lower()} with an estimated loss ratio of {loss_pct:.1f}% "
+                        f"and total loss of {self._fmt_money(total_loss)}."
+                    ),
+                    action=(
+                        "Trigger parametric response review, prioritize field validation for the affected area, and "
+                        "adjust underwriting appetite or emergency claims readiness for similar risks."
+                    ),
+                    confidence=0.86 if not damage_assessment.get("is_mock") else 0.74,
+                    explanation=(
+                        f"The image model classifies the area as {damage_label} in Zone {zone}, which is consistent "
+                        "with elevated post-event portfolio pressure."
+                    ),
+                    rpa_reference="RPA 99 zoning principles" if zone in {"IIb", "III"} else None,
+                    evidence=self._build_evidence(retrieved, count=3),
+                )
+            )
+            if loss_pct >= 25:
+                recommendations.append(
+                    RecommendationItem(
+                        priority="HIGH" if zone in {"IIb", "III"} else "MEDIUM",
+                        category="Tarification",
+                        title="Reprice similar exposed risks",
+                        description=(
+                            f"The assessed footprint in Zone {zone} implies meaningful post-event loss sensitivity "
+                            f"for comparable {damage_assessment.get('construction_type', 'construction')} exposures."
+                        ),
+                        action=(
+                            "Review technical pricing, sublimits, and deductibles for similar portfolios in the same commune "
+                            "or seismic zone before renewal."
+                        ),
+                        confidence=0.81 if not damage_assessment.get("is_mock") else 0.7,
+                        explanation=(
+                            f"Loss-per-km2 is estimated at {self._fmt_money(Decimal(str(damage_assessment.get('loss_per_km2_dzd', 0))))}, "
+                            "which indicates the event can materially erode margin if pricing stays unchanged."
+                        ),
+                        rpa_reference=None,
+                        evidence=self._build_evidence(retrieved, count=3),
+                    )
+                )
+
         return self._rank_recommendations_for_query(recommendations, context, user_query)
 
     def _compose_answer(self, query: str, context: dict, recommendations: list[RecommendationItem]) -> str:
@@ -562,6 +640,8 @@ class RAGService:
             sources.add("Monte Carlo Simulation")
         if context and context.get("ml_policy_score"):
             sources.add("CatBoost Policy Score")
+        if context and context.get("damage_assessment"):
+            sources.add("Damage Assessment")
         sources.update(f"{doc.source} - {doc.title}" for doc in retrieved)
         return sorted(sources)
 
@@ -792,6 +872,31 @@ class RAGService:
                     )
                 )
 
+        damage_assessment = context.get("damage_assessment")
+        if damage_assessment:
+            documents.append(
+                KnowledgeDocument(
+                    doc_id="damage-assessment-summary",
+                    title=f"Damage assessment {damage_assessment.get('commune_name') or damage_assessment.get('zone_sismique')}",
+                    source="Damage Assessment",
+                    tags=[
+                        "damage",
+                        str(damage_assessment.get("zone_sismique", "")).lower(),
+                        str(damage_assessment.get("damage_label", "")).lower(),
+                        str(damage_assessment.get("construction_type", "")).lower(),
+                    ],
+                    content=(
+                        f"Damage assessment for {damage_assessment.get('commune_name') or 'the assessed area'}: "
+                        f"class {damage_assessment.get('damage_class')} ({damage_assessment.get('damage_label')}), "
+                        f"loss ratio {damage_assessment.get('loss_percentage')}, "
+                        f"loss per km2 {damage_assessment.get('loss_per_km2_dzd')} DZD, "
+                        f"total loss {damage_assessment.get('total_loss_dzd')} DZD, "
+                        f"construction type {damage_assessment.get('construction_type')}, "
+                        f"zone {damage_assessment.get('zone_sismique')}."
+                    ),
+                )
+            )
+
         return documents
 
     def _rank_portfolio_documents(
@@ -878,6 +983,7 @@ class RAGService:
         premium_rows: list[PremiumAdequacyRow] = context["premium_adequacy"][:5]
         hotspots: list[HotspotData] = context["hotspots"][:5]
         monte_carlo = context.get("monte_carlo")
+        damage_assessment = context.get("damage_assessment")
         return f"""
 You are an expert insurance catastrophe analyst focused on Algerian seismic portfolio risk.
 Answer the user question using the provided portfolio data and retrieved knowledge.
@@ -927,6 +1033,9 @@ Top risk types:
 
 Monte Carlo simulation:
 {json.dumps(monte_carlo, default=str, ensure_ascii=True) if monte_carlo else "null"}
+
+Damage assessment:
+{json.dumps(damage_assessment, default=str, ensure_ascii=True) if damage_assessment else "null"}
 
 Retrieved knowledge:
 {json.dumps([item.model_dump(mode="json") for item in retrieved], ensure_ascii=True)}

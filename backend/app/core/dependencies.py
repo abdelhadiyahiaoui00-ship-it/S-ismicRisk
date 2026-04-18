@@ -3,6 +3,7 @@ from pathlib import Path
 
 from app.db.session import get_db
 from app.rag.service import RAGService
+from app.services.damage_ai_service import DamageAIService, damage_ai_service
 from app.services.ml_service import MLService, ml_service
 
 
@@ -20,4 +21,10 @@ def get_ml_service() -> MLService:
     return ml_service
 
 
-__all__ = ["get_db", "get_rag_service", "get_ml_service"]
+@lru_cache
+def get_damage_ai_service() -> DamageAIService:
+    damage_ai_service.load_model()
+    return damage_ai_service
+
+
+__all__ = ["get_db", "get_rag_service", "get_ml_service", "get_damage_ai_service"]
