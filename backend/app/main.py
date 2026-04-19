@@ -8,6 +8,7 @@ from app.api.router import api_router
 from app.core.config import settings
 from app.core.dependencies import get_ml_service, get_rag_service
 from app.schemas.health import HealthResponse, RootResponse
+from app.services.keep_alive_service import keep_alive_service
 
 
 def create_application() -> FastAPI:
@@ -47,6 +48,7 @@ def create_application() -> FastAPI:
     async def initialize_services() -> None:
         get_rag_service()
         get_ml_service()
+        keep_alive_service.start()
 
     app.include_router(api_router, prefix=settings.api_v1_prefix)
     if settings.api_v1_prefix != "/api":

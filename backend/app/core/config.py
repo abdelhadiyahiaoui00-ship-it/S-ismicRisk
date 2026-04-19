@@ -74,6 +74,9 @@ class Settings(BaseSettings):
 
     uploads_dir: str = Field(default="uploads", alias="UPLOADS_DIR")
     heatmaps_dir: str = Field(default="uploads/heatmaps", alias="HEATMAPS_DIR")
+    keep_alive_url: str = Field(default="https://your-app-name.onrender.com", alias="KEEP_ALIVE_URL")
+    keep_alive_interval_seconds: int = Field(default=300, alias="KEEP_ALIVE_INTERVAL_SECONDS")
+    enable_keep_alive: bool = Field(default=False, alias="ENABLE_KEEP_ALIVE")
 
     cors_origins: Annotated[list[str], NoDecode, BeforeValidator(_parse_cors_origins)] = Field(
         default=["http://localhost:3000", "http://localhost:5173", "https://aecnerd.netlify.app"],
