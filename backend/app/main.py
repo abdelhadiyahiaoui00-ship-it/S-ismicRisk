@@ -44,6 +44,10 @@ def create_application() -> FastAPI:
     async def healthcheck() -> HealthResponse:
         return HealthResponse(status="ok", service="backend", environment=settings.environment)
 
+    @app.head("/health", tags=["Health"], status_code=status.HTTP_200_OK)
+    async def healthcheck_head() -> None:
+        return None
+
     @app.on_event("startup")
     async def initialize_services() -> None:
         get_rag_service()
